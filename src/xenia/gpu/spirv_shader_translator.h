@@ -368,10 +368,13 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // the gather buffer per vertex (the per-vertex stride, in vec4s); reads past
   // this fall back to the direct (Metal-broken) read.
   static constexpr uint32_t kDivergentGatherMaxReads = 32;
-  // Upper bound on the vertex ordinal (gl_VertexIndex) the gather buffer is
-  // sized for - draws that could exceed it don't get the workaround.
+  // Upper bound on the vertex ordinal (raw gl_VertexIndex - for a 16-bit index
+  // buffer, the little-endian index value) the gather buffer is sized for.
   static constexpr uint32_t kDivergentGatherMaxVertices = 65536;
   static constexpr uint32_t kDivergentGatherComputeGroupSize = 64;
+  // Pre-pass push constant sentinel: the draw is non-indexed, so
+  // gl_GlobalInvocationID.x is the vertex ordinal directly.
+  static constexpr uint32_t kDivergentGatherSequentialIndices = 0xFFFFFFFFu;
 
   // The minimum limit for maxPerStageDescriptorStorageBuffers is 4, and for
   // maxStorageBufferRange it's 128 MB. These are the values of those limits on
@@ -1086,6 +1089,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
   uint32_t divergent_gather_slot_;
   // gl_GlobalInvocationID input for the compute pre-pass.
   spv::Id input_global_invocation_id_;
+  // Push constant block for the pre-pass: a single uint, the guest byte address
+  // of the 16-bit index buffer (or kDivergentGatherSequentialIndices for a
+  // non-indexed draw, where gl_GlobalInvocationID.x is the vertex ordinal).
+  spv::Id push_constants_divergent_gather_;
   spv::Id uniform_fetch_constants_;
 
   spv::Id buffers_shared_memory_;

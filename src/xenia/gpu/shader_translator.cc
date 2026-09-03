@@ -676,6 +676,18 @@ bool ShaderTranslator::TranslateAnalyzedShader(
   translation.translated_binary_ = CompleteTranslation();
   translation.is_translated_ = true;
 
+  if (const char* dump_dir = std::getenv("XE_DUMP_SPIRV")) {
+    std::string path = fmt::format("{}/sh_{:016X}_{:016X}.spv", dump_dir,
+                                   shader.ucode_data_hash(),
+                                   translation.modification());
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (f) {
+      std::fwrite(translation.translated_binary_.data(), 1,
+                  translation.translated_binary_.size(), f);
+      std::fclose(f);
+    }
+  }
+
   bool is_valid = true;
   for (const auto& error : translation.errors_) {
     if (error.is_fatal) {

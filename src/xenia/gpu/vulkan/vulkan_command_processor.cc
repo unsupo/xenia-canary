@@ -624,8 +624,14 @@ bool VulkanCommandProcessor::SetupContext() {
         uint32_t(xe::countof(divergent_gather_set_layouts));
     divergent_gather_pipeline_layout_create_info.pSetLayouts =
         divergent_gather_set_layouts;
-    divergent_gather_pipeline_layout_create_info.pushConstantRangeCount = 0;
-    divergent_gather_pipeline_layout_create_info.pPushConstantRanges = nullptr;
+    VkPushConstantRange divergent_gather_push_constant_range;
+    divergent_gather_push_constant_range.stageFlags =
+        VK_SHADER_STAGE_COMPUTE_BIT;
+    divergent_gather_push_constant_range.offset = 0;
+    divergent_gather_push_constant_range.size = 2 * sizeof(uint32_t);
+    divergent_gather_pipeline_layout_create_info.pushConstantRangeCount = 1;
+    divergent_gather_pipeline_layout_create_info.pPushConstantRanges =
+        &divergent_gather_push_constant_range;
     if (dfn.vkCreatePipelineLayout(
             device, &divergent_gather_pipeline_layout_create_info, nullptr,
             &divergent_gather_pipeline_layout_) != VK_SUCCESS) {
@@ -3064,13 +3070,27 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   // returns as 0 - into the gather buffer the real vertex shader reads with an
   // affine index. v1: non-indexed host draws only (gl_VertexIndex == the
   // sequential vertex ordinal the pre-pass dispatches over).
+  // v1 covers non-indexed draws and 16-bit kGuestDMA indexed draws (Vulkan
+  // binds the guest index buffer directly, so gl_VertexIndex is the raw
+  // little-endian 16-bit index value - which the pre-pass reads back from
+  // shared memory via the push constant below - and stays within the gather
+  // buffer's 65536-ordinal range).
+  bool divergent_gather_index_is_sequential =
+      primitive_processing_result.index_buffer_type ==
+      PrimitiveProcessor::ProcessedIndexBufferType::kNone;
+  bool divergent_gather_index_is_16bit_dma =
+      primitive_processing_result.index_buffer_type ==
+          PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA &&
+      primitive_processing_result.host_index_format ==
+          xenos::IndexFormat::kInt16 &&
+      !shader_32bit_index_dma;
   if (divergent_gather_supported_ &&
       divergent_gather_pipeline_layout_ != VK_NULL_HANDLE &&
       cvars::divergent_float_constant_gather &&
       primitive_processing_result.host_vertex_shader_type ==
           Shader::HostVertexShaderType::kVertex &&
-      primitive_processing_result.index_buffer_type ==
-          PrimitiveProcessor::ProcessedIndexBufferType::kNone &&
+      (divergent_gather_index_is_sequential ||
+       divergent_gather_index_is_16bit_dma) &&
       vertex_shader->constant_register_map().float_dynamic_addressing &&
       !vertex_shader->memexport_eM_written() &&
       vertex_shader->GetTextureBindingsAfterTranslation().empty() &&
@@ -3100,6 +3120,16 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
           VK_PIPELINE_BIND_POINT_COMPUTE, divergent_gather_pipeline_layout_, 0,
           uint32_t(xe::countof(divergent_gather_descriptor_sets)),
           divergent_gather_descriptor_sets, 0, nullptr);
+      uint32_t divergent_gather_push_constants[2] = {
+          divergent_gather_index_is_sequential
+              ? SpirvShaderTranslator::kDivergentGatherSequentialIndices
+              : primitive_processing_result.guest_index_base,
+          primitive_processing_result.host_draw_vertex_count,
+      };
+      deferred_command_buffer_.CmdVkPushConstants(
+          divergent_gather_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+          sizeof(divergent_gather_push_constants),
+          divergent_gather_push_constants);
       deferred_command_buffer_.CmdVkDispatch(
           (primitive_processing_result.host_draw_vertex_count +
            (SpirvShaderTranslator::kDivergentGatherComputeGroupSize - 1)) /
