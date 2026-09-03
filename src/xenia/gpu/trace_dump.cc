@@ -15,6 +15,7 @@
 #include "xenia/base/profiling.h"
 #include "xenia/base/string.h"
 #include "xenia/base/threading.h"
+#include "xenia/config.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/memory.h"
@@ -38,6 +39,8 @@
 DEFINE_path(target_trace_file, "", "Specifies the trace file to load.",
             "GPU.Debug");
 DEFINE_path(trace_dump_path, "", "Output path for dumped files.", "GPU.Debug");
+
+DECLARE_bool(async_shader_compilation);
 
 namespace xe {
 namespace gpu {
@@ -102,7 +105,24 @@ int TraceDump::Main(const std::vector<std::string>& args) {
 
 bool TraceDump::Setup() {
   // Create the emulator but don't initialize so we can setup the window.
-  emulator_ = std::make_unique<Emulator>("", "", "", "");
+  // Kernel + XAM setup touch the dashboard content directory and a logged-in
+  // profile, which throw with an empty root - resolve the same storage root the
+  // main app uses by default (<user folder>/Xenia) so the trace replays.
+  std::filesystem::path storage_root = xe::filesystem::GetExecutableFolder();
+  if (!std::filesystem::exists(storage_root / "portable.txt")) {
+    storage_root = xe::filesystem::GetUserFolder() / "Xenia";
+  }
+  storage_root = std::filesystem::absolute(storage_root);
+  XELOGI("Trace dump storage root: {}", xe::path_to_utf8(storage_root));
+  // Load the same config.toml the main app uses so backend-affecting cvars
+  // (e.g. gpu_allow_invalid_fetch_constants, render_target_path_vulkan) match.
+  config::SetupConfig(storage_root);
+  // The trace player issues the whole frame synchronously; async pipeline
+  // creation can't keep up and every draw fails with a null pipeline. Force
+  // synchronous shader/pipeline compilation for deterministic replay.
+  cvars::async_shader_compilation = false;
+  emulator_ = std::make_unique<Emulator>(
+      "", storage_root, storage_root / "content", storage_root / "cache");
   X_STATUS result = emulator_->Setup(
       nullptr, nullptr, false, nullptr,
       [this]() { return CreateGraphicsSystem(); }, nullptr);
@@ -150,7 +170,11 @@ int TraceDump::Run() {
                            raw_image.data.data(),
                            static_cast<int>(raw_image.stride));
     fclose(handle);
+    XELOGI("Wrote {}", xe::path_to_utf8(png_path));
   } else {
+    // Replay still ran (useful for instrumented debugging) - only the guest
+    // output image couldn't be captured, e.g. no offscreen presenter.
+    XELOGW("Trace replayed but no guest output image could be captured");
     result = 1;
   }
 

@@ -32,10 +32,17 @@ if(WIN32)
     )
   endif()
 else()
-  target_sources(xenia-app PRIVATE
-    ${PROJECT_SOURCE_DIR}/src/xenia/base/main_init_posix.cc
-    ${PROJECT_SOURCE_DIR}/src/xenia/ui/windowed_app_main_posix.cc
-  )
+  if(APPLE)
+    target_sources(xenia-app PRIVATE
+      ${PROJECT_SOURCE_DIR}/src/xenia/base/main_init_posix.cc
+      ${PROJECT_SOURCE_DIR}/src/xenia/ui/windowed_app_main_mac.mm
+    )
+  else()
+    target_sources(xenia-app PRIVATE
+      ${PROJECT_SOURCE_DIR}/src/xenia/base/main_init_posix.cc
+      ${PROJECT_SOURCE_DIR}/src/xenia/ui/windowed_app_main_posix.cc
+    )
+  endif()
   if(NOT MSVC AND XE_TARGET_X86_64)
     set_source_files_properties(
       ${PROJECT_SOURCE_DIR}/src/xenia/base/main_init_posix.cc
@@ -53,7 +60,6 @@ target_compile_definitions(xenia-app PRIVATE
 target_link_libraries(xenia-app PRIVATE
   xenia-apu
   xenia-apu-nop
-  xenia-base
   xenia-core
   xenia-cpu
   xenia-gpu
@@ -64,6 +70,7 @@ target_link_libraries(xenia-app PRIVATE
   xenia-patcher
   xenia-ui
   xenia-vfs
+  xenia-base
   # Third-party
   aes_128
   capstone
@@ -78,14 +85,12 @@ target_link_libraries(xenia-app PRIVATE
   xxhash
 )
 
-# Vulkan/SPIR-V backends (not macOS)
-if(NOT APPLE)
-  target_link_libraries(xenia-app PRIVATE
-    xenia-gpu-vulkan
-    xenia-ui-vulkan
-    glslang-spirv
-  )
-endif()
+# Vulkan/SPIR-V backends
+target_link_libraries(xenia-app PRIVATE
+  xenia-gpu-vulkan
+  xenia-ui-vulkan
+  glslang-spirv
+)
 
 # Non-Android specific (always true for Windows/Linux)
 target_link_libraries(xenia-app PRIVATE

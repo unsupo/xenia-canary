@@ -48,6 +48,8 @@ DECLARE_bool(gpu_3d_to_2d_texture);
 
 DECLARE_bool(force_depth_clamp);
 
+DECLARE_bool(protect_zero_alpha_readbacks);
+
 #define XE_GPU_FINE_GRAINED_DRAW_SCOPES 1
 
 #endif  // XENIA_GPU_GPU_FLAGS_H_

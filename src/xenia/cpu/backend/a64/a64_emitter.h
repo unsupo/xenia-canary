@@ -11,6 +11,7 @@
 #define XENIA_CPU_BACKEND_A64_A64_EMITTER_H_
 
 #include <functional>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -45,7 +46,7 @@ enum class FPCRMode : uint32_t { Unknown, Fpu, Vmx };
 // Unfortunately due to the design of xbyak we have to pass this to the ctor.
 class XbyakA64Allocator : public Xbyak_aarch64::Allocator {
  public:
-  virtual bool useProtect() const { return false; }
+  virtual bool useProtect() const override { return false; }
 };
 
 class A64Emitter;
@@ -117,6 +118,11 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
 
   void Call(const hir::Instr* instr, GuestFunction* function);
   void CallIndirect(const hir::Instr* instr, int reg_index);
+  // Emits the guest->host call target resolution into x9, assuming w16 already
+  // holds the guest address. Uses the 64-bit indirection table when available
+  // (with a null-slot fallback to resolve_function_thunk), otherwise routes
+  // straight through resolve_function_thunk. Clobbers x8/x16/x17.
+  void EmitResolveGuestCallTarget();
   void CallExtern(const hir::Instr* instr, const Function* function);
   void CallNative(void* fn);
   void CallNativeSafe(void* fn);

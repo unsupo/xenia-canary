@@ -22,10 +22,21 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <ctime>
 
 #include "logging.h"
+
+#ifdef __APPLE__
+#include <mach/mach_time.h>
+#include <mach/mach.h>
+#define SIGRTMIN SIGUSR1
+#define SIGRTMAX (SIGUSR2 + 1)
+#define PTHREAD_MUTEX_ROBUST PTHREAD_MUTEX_NORMAL
+#define pthread_mutex_consistent(m) 0
+#define pthread_mutexattr_setrobust(a, b) 0
+#endif
 
 #if XE_PLATFORM_ANDROID
 #include <dlfcn.h>
@@ -137,11 +148,17 @@ void install_signal_handler(SignalType type) {
 // TODO(dougvj)
 void EnableAffinityConfiguration() {}
 
-// uint64_t ticks() { return mach_absolute_time(); }
+#ifdef __APPLE__
+uint64_t ticks() { return mach_absolute_time(); }
 
+uint32_t current_thread_system_id() {
+  return static_cast<uint32_t>(pthread_mach_thread_np(pthread_self()));
+}
+#else
 uint32_t current_thread_system_id() {
   return static_cast<uint32_t>(syscall(SYS_gettid));
 }
+#endif
 
 void MaybeYield() {
   sched_yield();
@@ -606,7 +623,11 @@ class PosixCondition<Thread> final : public PosixConditionBase {
         exit_code_(0),
         state_(State::kUninitialized),
         suspend_count_(0) {
+#ifdef __APPLE__
+    semaphore_create(mach_task_self(), &suspend_sem_, SYNC_POLICY_FIFO, 0);
+#else
     sem_init(&suspend_sem_, 0, 0);
+#endif
 #if XE_PLATFORM_ANDROID
     android_pre_api_26_name_[0] = '\0';
 #endif
@@ -614,6 +635,8 @@ class PosixCondition<Thread> final : public PosixConditionBase {
   bool Initialize(Thread::CreationParameters params,
                   ThreadStartData* start_data) {
     start_data->create_suspended = params.create_suspended;
+    state_ = params.create_suspended ? State::kSuspended : State::kRunning;
+    suspend_count_ = params.create_suspended ? 1 : 0;
     pthread_attr_t attr;
     if (pthread_attr_init(&attr) != 0) {
       return false;
@@ -646,12 +669,16 @@ class PosixCondition<Thread> final : public PosixConditionBase {
   /// Thread::GetCurrentThread() on the main thread
   explicit PosixCondition(pthread_t thread)
       : thread_(thread),
-        tid_(static_cast<pid_t>(syscall(SYS_gettid))),
+        tid_(static_cast<pid_t>(current_thread_system_id())),
         signaled_(false),
         exit_code_(0),
         state_(State::kRunning),
         suspend_count_(0) {
+#ifdef __APPLE__
+    semaphore_create(mach_task_self(), &suspend_sem_, SYNC_POLICY_FIFO, 0);
+#else
     sem_init(&suspend_sem_, 0, 0);
+#endif
 #if XE_PLATFORM_ANDROID
     android_pre_api_26_name_[0] = '\0';
 #endif
@@ -713,7 +740,13 @@ class PosixCondition<Thread> final : public PosixConditionBase {
     WaitStarted();
     std::unique_lock<std::mutex> lock(state_mutex_);
     if (state_ != State::kUninitialized && state_ != State::kFinished) {
+#ifdef __APPLE__
+      if (thread_ == pthread_self()) {
+        pthread_setname_np(std::string(name).c_str());
+      }
+#else
       pthread_setname_np(thread_, std::string(name).c_str());
+#endif
 #if XE_PLATFORM_ANDROID
       SetAndroidPreApi26Name(name);
 #endif
@@ -731,9 +764,16 @@ class PosixCondition<Thread> final : public PosixConditionBase {
   }
 #endif
 
+#ifdef __APPLE__
+  uint32_t system_id() const { return static_cast<uint32_t>(pthread_mach_thread_np(thread_)); }
+#else
   uint32_t system_id() const { return static_cast<uint32_t>(thread_); }
+#endif
 
   uint64_t affinity_mask() const {
+#ifdef __APPLE__
+    return 0; // Not supported on macOS
+#else
     WaitStarted();
     cpu_set_t cpu_set;
 #if XE_PLATFORM_ANDROID
@@ -753,9 +793,11 @@ class PosixCondition<Thread> final : public PosixConditionBase {
       result |= set << i;
     }
     return result;
+#endif
   }
 
   void set_affinity_mask(uint64_t mask) const {
+#ifndef __APPLE__
     WaitStarted();
     cpu_set_t cpu_set;
     CPU_ZERO(&cpu_set);
@@ -773,6 +815,7 @@ class PosixCondition<Thread> final : public PosixConditionBase {
     if (pthread_setaffinity_np(thread_, sizeof(cpu_set_t), &cpu_set) != 0) {
       assert_always();
     }
+#endif
 #endif
   }
 
@@ -829,17 +872,32 @@ class PosixCondition<Thread> final : public PosixConditionBase {
 
   void QueueUserCallback(std::function<void()> callback) {
     WaitStarted();
-    std::unique_lock lock(callback_mutex_);
-    user_callback_ = std::move(callback);
+    {
+      std::unique_lock lock(callback_mutex_);
+      user_callback_ = std::move(callback);
+    }
+    // Mark before delivering the signal so an alertable Wait() that polls this
+    // flag cannot miss the wake even if the signal itself races the wait (see
+    // the alertable path in xe::threading::Wait). On Linux the signal alone was
+    // enough; on Darwin pthread_cond_wait is not reliably broken by a signal.
+    user_callback_pending_.store(true, std::memory_order_release);
     sigval value{};
     value.sival_ptr = this;
 #if XE_PLATFORM_ANDROID
     sigqueue(pthread_gettid_np(thread_),
              GetSystemSignal(SignalType::kThreadUserCallback), value);
+#elif defined(__APPLE__)
+    pthread_kill(thread_, GetSystemSignal(SignalType::kThreadUserCallback));
 #else
     pthread_sigqueue(thread_, GetSystemSignal(SignalType::kThreadUserCallback),
                      value);
 #endif
+  }
+
+  // Consumed by an alertable Wait() to report WaitResult::kUserCallback so the
+  // caller (e.g. NtWaitForSingleObjectEx) runs xeProcessUserApcs.
+  bool ConsumeUserCallbackPending() {
+    return user_callback_pending_.exchange(false, std::memory_order_acq_rel);
   }
 
   void CallUserCallback() const {
@@ -866,9 +924,11 @@ class PosixCondition<Thread> final : public PosixConditionBase {
     if (suspend_count_ == 0 && state_ == State::kSuspended) {
       state_ = State::kRunning;
       // Post to the semaphore to wake the thread from WaitSuspended.
-      // sem_post is async-signal-safe, so this is safe even if called
-      // from unusual contexts.
+#ifdef __APPLE__
+      semaphore_signal(suspend_sem_);
+#else
       sem_post(&suspend_sem_);
+#endif
     }
     state_signal_.notify_all();
     return true;
@@ -967,10 +1027,15 @@ class PosixCondition<Thread> final : public PosixConditionBase {
   /// without risking deadlock or heap corruption from non-reentrant
   /// mutex/condvar operations.
   void WaitSuspended() {
+#ifdef __APPLE__
+    while (semaphore_wait(suspend_sem_) == KERN_ABORTED) {
+    }
+#else
     int ret;
     do {
       ret = sem_wait(&suspend_sem_);
     } while (ret == -1 && errno == EINTR);
+#endif
   }
 
   void* native_handle() const override {
@@ -984,7 +1049,11 @@ class PosixCondition<Thread> final : public PosixConditionBase {
     if (thread_) {
       pthread_join(thread_, nullptr);
     }
+#ifdef __APPLE__
+    semaphore_destroy(mach_task_self(), suspend_sem_);
+#else
     sem_destroy(&suspend_sem_);
+#endif
   }
   pthread_t thread_;
   pid_t tid_ = 0;                     // Kernel TID for setpriority() fallback
@@ -993,11 +1062,16 @@ class PosixCondition<Thread> final : public PosixConditionBase {
   int exit_code_;
   State state_;             // Protected by state_mutex_
   uint32_t suspend_count_;  // Protected by state_mutex_
+#ifdef __APPLE__
+  semaphore_t suspend_sem_{};
+#else
   sem_t suspend_sem_;       // Async-signal-safe suspend/resume semaphore
+#endif
   mutable std::mutex state_mutex_;
   mutable std::mutex callback_mutex_;
   mutable std::condition_variable state_signal_;
   std::function<void()> user_callback_;
+  std::atomic<bool> user_callback_pending_{false};
 #if XE_PLATFORM_ANDROID
   // Name accessible via name() on Android before API 26 which added
   // pthread_getname_np.
@@ -1059,19 +1133,53 @@ template <>
 PosixConditionHandle<Thread>::PosixConditionHandle(pthread_t thread)
     : handle_(thread) {}
 
+// Defined after PosixThread: reports and clears a pending user callback (queued
+// APC wake, see PosixCondition<Thread>::QueueUserCallback) for the calling
+// thread.
+static bool ConsumeCurrentThreadUserCallbackPending();
+
 WaitResult Wait(WaitHandle* wait_handle, bool is_alertable,
                 std::chrono::milliseconds timeout) {
   auto posix_wait_handle = dynamic_cast<PosixWaitHandle*>(wait_handle);
   if (posix_wait_handle == nullptr) {
     return WaitResult::kFailed;
   }
-  if (is_alertable) {
-    alertable_state_ = true;
+  if (!is_alertable) {
+    return posix_wait_handle->condition().Wait(timeout);
   }
-  auto result = posix_wait_handle->condition().Wait(timeout);
-  if (is_alertable) {
-    alertable_state_ = false;
+  // Alertable wait. A user APC can be queued (QueueUserCallback) while we're
+  // blocked; the delivery signal is not a reliable way to break
+  // pthread_cond_wait on Darwin, so poll in short slices and check the pending
+  // flag. Returning kUserCallback makes the caller (NtWaitForSingleObjectEx,
+  // KeWaitForSingleObject, ...) run xeProcessUserApcs and re-wait.
+  alertable_state_ = true;
+  const auto poll_slice = std::chrono::milliseconds(16);
+  const bool infinite = timeout == std::chrono::milliseconds::max();
+  auto remaining = timeout;
+  WaitResult result = WaitResult::kTimeout;
+  for (;;) {
+    if (ConsumeCurrentThreadUserCallbackPending()) {
+      result = WaitResult::kUserCallback;
+      break;
+    }
+    auto slice = infinite ? poll_slice : std::min(remaining, poll_slice);
+    result = posix_wait_handle->condition().Wait(slice);
+    if (result != WaitResult::kTimeout) {
+      break;
+    }
+    if (ConsumeCurrentThreadUserCallbackPending()) {
+      result = WaitResult::kUserCallback;
+      break;
+    }
+    if (!infinite) {
+      if (remaining <= poll_slice) {
+        result = WaitResult::kTimeout;
+        break;
+      }
+      remaining -= poll_slice;
+    }
   }
+  alertable_state_ = false;
   return result;
 }
 
@@ -1296,6 +1404,11 @@ class PosixThread final : public PosixConditionHandle<Thread> {
 
 thread_local PosixThread* current_thread_ = nullptr;
 
+static bool ConsumeCurrentThreadUserCallbackPending() {
+  return current_thread_ != nullptr &&
+         current_thread_->condition().ConsumeUserCallbackPending();
+}
+
 void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
 #if !XE_PLATFORM_ANDROID
   if (pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, nullptr) != 0) {
@@ -1314,17 +1427,14 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
   delete start_data;
 
   current_thread_ = thread;
-  thread->handle_.tid_ = static_cast<pid_t>(syscall(SYS_gettid));
+  thread->handle_.tid_ = static_cast<pid_t>(current_thread_system_id());
   {
     std::unique_lock lock(thread->handle_.state_mutex_);
-    thread->handle_.state_ =
-        create_suspended ? State::kSuspended : State::kRunning;
     thread->handle_.state_signal_.notify_all();
   }
 
   if (create_suspended) {
     std::unique_lock lock(thread->handle_.state_mutex_);
-    thread->handle_.suspend_count_ = 1;
     thread->handle_.state_signal_.wait(
         lock, [thread] { return thread->handle_.suspend_count_ == 0; });
   }
@@ -1392,7 +1502,11 @@ void Thread::Exit(int exit_code) {
 }
 
 void set_name(const std::string_view name) {
+#ifdef __APPLE__
+  pthread_setname_np(std::string(name).c_str());
+#else
   pthread_setname_np(pthread_self(), std::string(name).c_str());
+#endif
 #if XE_PLATFORM_ANDROID
   if (!android_pthread_getname_np_ && current_thread_) {
     current_thread_->condition().SetAndroidPreApi26Name(name);
@@ -1411,12 +1525,19 @@ static void signal_handler(int signal, siginfo_t* info, void* context) {
       current_thread_->WaitSuspended();
     } break;
     case SignalType::kThreadUserCallback: {
+#ifdef __APPLE__
+      auto p_thread = current_thread_;
+      if (alertable_state_ && p_thread) {
+        p_thread->condition().CallUserCallback();
+      }
+#else
       assert_not_null(info->si_value.sival_ptr);
       auto p_thread =
           static_cast<PosixCondition<Thread>*>(info->si_value.sival_ptr);
-      if (alertable_state_) {
+      if (alertable_state_ && p_thread) {
         p_thread->CallUserCallback();
       }
+#endif
     } break;
 #if XE_PLATFORM_ANDROID
     case SignalType::kThreadTerminate: {

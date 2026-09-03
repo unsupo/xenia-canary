@@ -1456,9 +1456,32 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                                        uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  XELOGI("VulkanCommandProcessor::IssueSwap called (fb_ptr={:08X}, {}x{})",
+         frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 
   ui::Presenter* presenter = graphics_system_->presenter();
   if (!presenter) {
+    // Headless (GPU trace dumper): no presenter to hand the frame to. Dump the
+    // guest scanout buffer straight from memory so the replayed frame can still
+    // be inspected. Controlled by the XE_DUMP_SWAP env var (path prefix).
+    if (const char* dump_prefix = std::getenv("XE_DUMP_SWAP")) {
+      static uint32_t xe_swap_n = 0;
+      uint32_t w = frontbuffer_width ? frontbuffer_width : 1280;
+      uint32_t h = frontbuffer_height ? frontbuffer_height : 720;
+      const uint8_t* src = memory_->TranslatePhysical(frontbuffer_ptr);
+      if (src) {
+        std::string path =
+            fmt::format("{}_{:08X}_{}x{}_{}.raw", dump_prefix, frontbuffer_ptr,
+                        w, h, xe_swap_n++);
+        FILE* f = std::fopen(path.c_str(), "wb");
+        if (f) {
+          std::fwrite(src, 1, size_t(w) * h * 4, f);
+          std::fclose(f);
+          XELOGI("XE_DUMP_SWAP wrote {} ({}x{} @ {:08X})", path, w, h,
+                 frontbuffer_ptr);
+        }
+      }
+    }
     return;
   }
 
@@ -2411,6 +2434,14 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
     return false;
   }
   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
+  if (std::getenv("XE_LOG_DRAWS")) {
+    auto* ps = static_cast<VulkanShader*>(active_pixel_shader());
+    bool skinned =
+        vertex_shader->constant_register_map().float_dynamic_addressing;
+    XELOGI("XE_DRAW VS={:016X}{} PS={:016X} prim={} idx={}",
+           vertex_shader->ucode_data_hash(), skinned ? " SKIN" : "",
+           ps ? ps->ucode_data_hash() : 0, uint32_t(prim_type), index_count);
+  }
   // TODO(Triang3l): If the shader uses memory export, but
   // vertexPipelineStoresAndAtomics is not supported, convert the vertex shader
   // to a compute shader and dispatch it after the draw if the draw doesn't use
@@ -2497,6 +2528,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
             Shader::HostVertexShaderType::kVertex &&
         primitive_processing_result.host_vertex_shader_type !=
             Shader::HostVertexShaderType::kPointListAsTriangleStrip &&
+        primitive_processing_result.host_vertex_shader_type !=
+            Shader::HostVertexShaderType::kRectangleListAsTriangleStrip &&
         !Shader::IsHostVertexShaderTypeDomain(
             primitive_processing_result.host_vertex_shader_type)) {
       return false;

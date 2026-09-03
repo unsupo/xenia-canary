@@ -152,6 +152,26 @@ void SpirvShaderTranslator::Reset() {
   var_main_memexport_data_written_ = spv::NoResult;
   main_memexport_allowed_ = spv::NoResult;
   var_main_point_size_edge_flag_kill_vertex_ = spv::NoResult;
+  var_rect_loop_i_ = spv::NoResult;
+  var_rect_acc_position_ = spv::NoResult;
+  std::ranges::fill(var_rect_acc_interpolators_, spv::NoResult);
+  var_rect_acc_clip_distance_.clear();
+  var_rect_acc_cull_distance_.clear();
+  var_rect_acc_point_size_ = spv::NoResult;
+  var_rect_v_position_ = spv::NoResult;
+  std::ranges::fill(var_rect_v_interpolators_, spv::NoResult);
+  var_rect_v_clip_distance_.clear();
+  var_rect_v_cull_distance_.clear();
+  var_rect_v_point_size_ = spv::NoResult;
+  type_rect_v_float4_array_3_ = spv::NoResult;
+  type_rect_v_float_array_3_ = spv::NoResult;
+  rect_corner_int_ = spv::NoResult;
+  var_rect_memexport_ok_ = spv::NoResult;
+  rect_end_i_ = spv::NoResult;
+  rect_is_corner_3_ = spv::NoResult;
+  rect_loop_header_ = nullptr;
+  rect_loop_continue_ = nullptr;
+  rect_loop_merge_ = nullptr;
   var_main_kill_pixel_ = spv::NoResult;
   var_main_fsi_color_written_ = spv::NoResult;
   std::ranges::fill(output_fragment_data_, spv::NoResult);
@@ -588,6 +608,110 @@ void SpirvShaderTranslator::StartTranslation() {
           spv::NoPrecision, spv::StorageClassFunction, type_uint_,
           "xe_var_memexport_data_written", const_uint_0_);
     }
+    if (is_vertex_shader() &&
+        GetSpirvShaderModification().vertex.host_vertex_shader_type ==
+            Shader::HostVertexShaderType::kRectangleListAsTriangleStrip) {
+      var_rect_loop_i_ = builder_->createVariable(
+          spv::NoPrecision, spv::StorageClassFunction, type_int_,
+          "xe_var_rect_loop_i", const_int_0_);
+      var_rect_acc_position_ = builder_->createVariable(
+          spv::NoPrecision, spv::StorageClassFunction, type_float4_,
+          "xe_var_rect_acc_position", const_float4_0_);
+      uint32_t interpolators_remaining = GetModificationInterpolatorMask();
+      uint32_t interpolator_index;
+      while (
+          xe::bit_scan_forward(interpolators_remaining, &interpolator_index)) {
+        interpolators_remaining &= ~(UINT32_C(1) << interpolator_index);
+        var_rect_acc_interpolators_[interpolator_index] =
+            builder_->createVariable(
+                spv::NoPrecision, spv::StorageClassFunction, type_float4_,
+                fmt::format("xe_var_rect_acc_interpolator_{}",
+                            interpolator_index)
+                    .c_str(),
+                const_float4_0_);
+      }
+      uint32_t user_clip_plane_count =
+          GetSpirvShaderModification().vertex.user_clip_plane_count;
+      uint32_t clip_distance_count = 0;
+      uint32_t cull_distance_count = 0;
+      if (GetSpirvShaderModification().vertex.user_clip_plane_cull) {
+        cull_distance_count = user_clip_plane_count;
+      } else {
+        clip_distance_count = user_clip_plane_count;
+      }
+      if (GetSpirvShaderModification().vertex.vertex_kill_and) {
+        ++cull_distance_count;
+      }
+      var_rect_acc_clip_distance_.resize(clip_distance_count);
+      for (uint32_t i = 0; i < clip_distance_count; ++i) {
+        var_rect_acc_clip_distance_[i] = builder_->createVariable(
+            spv::NoPrecision, spv::StorageClassFunction, type_float_,
+            fmt::format("xe_var_rect_acc_clip_distance_{}", i).c_str(),
+            const_float_0_);
+      }
+      var_rect_acc_cull_distance_.resize(cull_distance_count);
+      for (uint32_t i = 0; i < cull_distance_count; ++i) {
+        var_rect_acc_cull_distance_[i] = builder_->createVariable(
+            spv::NoPrecision, spv::StorageClassFunction, type_float_,
+            fmt::format("xe_var_rect_acc_cull_distance_{}", i).c_str(),
+            const_float_0_);
+      }
+      if (output_point_size_ != spv::NoResult) {
+        var_rect_acc_point_size_ = builder_->createVariable(
+            spv::NoPrecision, spv::StorageClassFunction, type_float_,
+            "xe_var_rect_acc_point_size", const_float_0_);
+      }
+
+      // Per-guest-vertex copies (loop iterations 0..2) for the longest-edge
+      // (diagonal) selection used to place the synthetic 4th corner.
+      type_rect_v_float4_array_3_ = builder_->makeArrayType(
+          type_float4_, builder_->makeUintConstant(3), 0);
+      type_rect_v_float_array_3_ = builder_->makeArrayType(
+          type_float_, builder_->makeUintConstant(3), 0);
+      id_vector_temp_.assign(3, const_float4_0_);
+      spv::Id const_rect_v_float4_array_3_0 = builder_->makeCompositeConstant(
+          type_rect_v_float4_array_3_, id_vector_temp_);
+      id_vector_temp_.assign(3, const_float_0_);
+      spv::Id const_rect_v_float_array_3_0 = builder_->makeCompositeConstant(
+          type_rect_v_float_array_3_, id_vector_temp_);
+      var_rect_v_position_ = builder_->createVariable(
+          spv::NoPrecision, spv::StorageClassFunction,
+          type_rect_v_float4_array_3_, "xe_var_rect_v_position",
+          const_rect_v_float4_array_3_0);
+      interpolators_remaining = GetModificationInterpolatorMask();
+      while (
+          xe::bit_scan_forward(interpolators_remaining, &interpolator_index)) {
+        interpolators_remaining &= ~(UINT32_C(1) << interpolator_index);
+        var_rect_v_interpolators_[interpolator_index] = builder_->createVariable(
+            spv::NoPrecision, spv::StorageClassFunction,
+            type_rect_v_float4_array_3_,
+            fmt::format("xe_var_rect_v_interpolator_{}", interpolator_index)
+                .c_str(),
+            const_rect_v_float4_array_3_0);
+      }
+      var_rect_v_clip_distance_.resize(clip_distance_count);
+      for (uint32_t i = 0; i < clip_distance_count; ++i) {
+        var_rect_v_clip_distance_[i] = builder_->createVariable(
+            spv::NoPrecision, spv::StorageClassFunction,
+            type_rect_v_float_array_3_,
+            fmt::format("xe_var_rect_v_clip_distance_{}", i).c_str(),
+            const_rect_v_float_array_3_0);
+      }
+      var_rect_v_cull_distance_.resize(cull_distance_count);
+      for (uint32_t i = 0; i < cull_distance_count; ++i) {
+        var_rect_v_cull_distance_[i] = builder_->createVariable(
+            spv::NoPrecision, spv::StorageClassFunction,
+            type_rect_v_float_array_3_,
+            fmt::format("xe_var_rect_v_cull_distance_{}", i).c_str(),
+            const_rect_v_float_array_3_0);
+      }
+      if (output_point_size_ != spv::NoResult) {
+        var_rect_v_point_size_ = builder_->createVariable(
+            spv::NoPrecision, spv::StorageClassFunction,
+            type_rect_v_float_array_3_, "xe_var_rect_v_point_size",
+            const_rect_v_float_array_3_0);
+      }
+    }
   }
 
   // Write the execution model-specific prologue with access to variables in the
@@ -734,6 +858,318 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
     CompleteVertexOrTessEvalShaderInMain();
   } else if (is_pixel_shader()) {
     CompleteFragmentShaderInMain();
+  }
+
+  if (is_vertex_shader() &&
+      GetSpirvShaderModification().vertex.host_vertex_shader_type ==
+          Shader::HostVertexShaderType::kRectangleListAsTriangleStrip) {
+    spv::Id current_i =
+        builder_->createLoad(var_rect_loop_i_, spv::NoPrecision);
+    spv::Id is_iter_0 = builder_->createBinOp(
+        spv::OpIEqual, type_bool_, current_i, const_int_0_);
+    spv::Id is_iter_0_bool4 =
+        builder_->smearScalar(spv::NoPrecision, is_iter_0, type_bool4_);
+    spv::Id is_corner_3_bool4 =
+        builder_->smearScalar(spv::NoPrecision, rect_is_corner_3_, type_bool4_);
+
+    // 1. Accumulate Position.
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(
+        builder_->makeIntConstant(kOutputPerVertexMemberPosition));
+    spv::Id position_ptr = builder_->createAccessChain(
+        spv::StorageClassOutput, output_per_vertex_, id_vector_temp_);
+    spv::Id pos = builder_->createLoad(position_ptr, spv::NoPrecision);
+    spv::Id neg_pos = builder_->createNoContractionUnaryOp(
+        spv::OpFNegate, type_float4_, pos);
+    spv::Id old_acc_pos =
+        builder_->createLoad(var_rect_acc_position_, spv::NoPrecision);
+    spv::Id add_acc_pos = builder_->createNoContractionBinOp(
+        spv::OpFAdd, type_float4_, old_acc_pos, pos);
+    spv::Id term_pos = builder_->createTriOp(
+        spv::OpSelect, type_float4_, is_iter_0_bool4, neg_pos, add_acc_pos);
+    spv::Id final_acc_pos = builder_->createTriOp(
+        spv::OpSelect, type_float4_, is_corner_3_bool4, term_pos, pos);
+    builder_->createStore(final_acc_pos, var_rect_acc_position_);
+    // Keep this iteration's transformed position for the merge-block diagonal
+    // (longest-edge) selection.
+    {
+      id_vector_temp_.assign(1, current_i);
+      builder_->createStore(
+          pos, builder_->createAccessChain(spv::StorageClassFunction,
+                                           var_rect_v_position_,
+                                           id_vector_temp_));
+    }
+
+    // 2. Accumulate Interpolators.
+    uint32_t interpolators_remaining = GetModificationInterpolatorMask();
+    uint32_t interpolator_index;
+    while (xe::bit_scan_forward(interpolators_remaining, &interpolator_index)) {
+      interpolators_remaining &= ~(UINT32_C(1) << interpolator_index);
+      spv::Id interp_var = input_output_interpolators_[interpolator_index];
+      assert_true(interp_var != spv::NoResult);
+      spv::Id interp = builder_->createLoad(interp_var, spv::NoPrecision);
+      spv::Id neg_interp = builder_->createNoContractionUnaryOp(
+          spv::OpFNegate, type_float4_, interp);
+      spv::Id old_acc_interp = builder_->createLoad(
+          var_rect_acc_interpolators_[interpolator_index], spv::NoPrecision);
+      spv::Id add_acc_interp = builder_->createNoContractionBinOp(
+          spv::OpFAdd, type_float4_, old_acc_interp, interp);
+      spv::Id term_interp = builder_->createTriOp(
+          spv::OpSelect, type_float4_, is_iter_0_bool4, neg_interp,
+          add_acc_interp);
+      spv::Id final_acc_interp = builder_->createTriOp(
+          spv::OpSelect, type_float4_, is_corner_3_bool4, term_interp, interp);
+      builder_->createStore(final_acc_interp,
+                            var_rect_acc_interpolators_[interpolator_index]);
+      id_vector_temp_.assign(1, current_i);
+      builder_->createStore(
+          interp, builder_->createAccessChain(
+                      spv::StorageClassFunction,
+                      var_rect_v_interpolators_[interpolator_index],
+                      id_vector_temp_));
+    }
+
+    // 3. Accumulate Clip Distances.
+    for (size_t k = 0; k < var_rect_acc_clip_distance_.size(); ++k) {
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(builder_->makeIntConstant(
+          int(output_per_vertex_clip_distance_member_index_)));
+      id_vector_temp_.push_back(builder_->makeIntConstant(int(k)));
+      spv::Id clip_ptr = builder_->createAccessChain(
+          spv::StorageClassOutput, output_per_vertex_, id_vector_temp_);
+      spv::Id clip_val = builder_->createLoad(clip_ptr, spv::NoPrecision);
+      spv::Id neg_clip = builder_->createNoContractionUnaryOp(
+          spv::OpFNegate, type_float_, clip_val);
+      spv::Id old_acc_clip = builder_->createLoad(
+          var_rect_acc_clip_distance_[k], spv::NoPrecision);
+      spv::Id add_acc_clip = builder_->createNoContractionBinOp(
+          spv::OpFAdd, type_float_, old_acc_clip, clip_val);
+      spv::Id term_clip = builder_->createTriOp(
+          spv::OpSelect, type_float_, is_iter_0, neg_clip, add_acc_clip);
+      spv::Id final_acc_clip = builder_->createTriOp(
+          spv::OpSelect, type_float_, rect_is_corner_3_, term_clip, clip_val);
+      builder_->createStore(final_acc_clip, var_rect_acc_clip_distance_[k]);
+      id_vector_temp_.assign(1, current_i);
+      builder_->createStore(
+          clip_val, builder_->createAccessChain(spv::StorageClassFunction,
+                                                var_rect_v_clip_distance_[k],
+                                                id_vector_temp_));
+    }
+
+    // 4. Accumulate Cull Distances.
+    for (size_t k = 0; k < var_rect_acc_cull_distance_.size(); ++k) {
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(builder_->makeIntConstant(
+          int(output_per_vertex_cull_distance_member_index_)));
+      id_vector_temp_.push_back(builder_->makeIntConstant(int(k)));
+      spv::Id cull_ptr = builder_->createAccessChain(
+          spv::StorageClassOutput, output_per_vertex_, id_vector_temp_);
+      spv::Id cull_val = builder_->createLoad(cull_ptr, spv::NoPrecision);
+      spv::Id neg_cull = builder_->createNoContractionUnaryOp(
+          spv::OpFNegate, type_float_, cull_val);
+      spv::Id old_acc_cull = builder_->createLoad(
+          var_rect_acc_cull_distance_[k], spv::NoPrecision);
+      spv::Id add_acc_cull = builder_->createNoContractionBinOp(
+          spv::OpFAdd, type_float_, old_acc_cull, cull_val);
+      spv::Id term_cull = builder_->createTriOp(
+          spv::OpSelect, type_float_, is_iter_0, neg_cull, add_acc_cull);
+      spv::Id final_acc_cull = builder_->createTriOp(
+          spv::OpSelect, type_float_, rect_is_corner_3_, term_cull, cull_val);
+      builder_->createStore(final_acc_cull, var_rect_acc_cull_distance_[k]);
+      id_vector_temp_.assign(1, current_i);
+      builder_->createStore(
+          cull_val, builder_->createAccessChain(spv::StorageClassFunction,
+                                                var_rect_v_cull_distance_[k],
+                                                id_vector_temp_));
+    }
+
+    // 5. Accumulate Point Size.
+    if (output_point_size_ != spv::NoResult &&
+        var_rect_acc_point_size_ != spv::NoResult) {
+      spv::Id pt_size =
+          builder_->createLoad(output_point_size_, spv::NoPrecision);
+      spv::Id neg_pt_size = builder_->createNoContractionUnaryOp(
+          spv::OpFNegate, type_float_, pt_size);
+      spv::Id old_acc_pt = builder_->createLoad(var_rect_acc_point_size_,
+                                                spv::NoPrecision);
+      spv::Id add_acc_pt = builder_->createNoContractionBinOp(
+          spv::OpFAdd, type_float_, old_acc_pt, pt_size);
+      spv::Id term_pt = builder_->createTriOp(
+          spv::OpSelect, type_float_, is_iter_0, neg_pt_size, add_acc_pt);
+      spv::Id final_acc_pt = builder_->createTriOp(
+          spv::OpSelect, type_float_, rect_is_corner_3_, term_pt, pt_size);
+      builder_->createStore(final_acc_pt, var_rect_acc_point_size_);
+      if (var_rect_v_point_size_ != spv::NoResult) {
+        id_vector_temp_.assign(1, current_i);
+        builder_->createStore(
+            pt_size, builder_->createAccessChain(spv::StorageClassFunction,
+                                                 var_rect_v_point_size_,
+                                                 id_vector_temp_));
+      }
+    }
+
+    // Advance loop counter: next_i = current_i + 1
+    spv::Id next_i = builder_->createBinOp(
+        spv::OpIAdd, type_int_, current_i, builder_->makeIntConstant(1));
+    builder_->createStore(next_i, var_rect_loop_i_);
+    spv::Id has_more = builder_->createBinOp(
+        spv::OpSLessThan, type_bool_, next_i, rect_end_i_);
+    builder_->createConditionalBranch(has_more, rect_loop_continue_,
+                                      rect_loop_merge_);
+
+    // Continuation block.
+    function_main_->addBlock(rect_loop_continue_);
+    builder_->setBuildPoint(rect_loop_continue_);
+    builder_->createBranch(rect_loop_header_);
+
+    // Merge block.
+    function_main_->addBlock(rect_loop_merge_);
+    builder_->setBuildPoint(rect_loop_merge_);
+
+    // Resolve this host corner's outputs from the 3 transformed guest vertices.
+    //
+    // The rectangle's diagonal is its longest edge. The two triangles of the
+    // host strip [s0,s1,s2,s3] share edge s1-s2, so s1/s2 must be the diagonal's
+    // endpoints and s0 the opposite ("apex") vertex - a reordering of the 3
+    // guest vertices, matching the Direct3D 12 rectangle-list geometry shader:
+    //   apex 0 -> strip (0,1,2)   apex 1 -> (1,2,0)   apex 2 -> (2,0,1)
+    // The synthetic 4th corner completes the parallelogram: s3 = s1 + s2 - s0.
+    spv::Id ci0 = const_int_0_;
+    spv::Id ci1 = builder_->makeIntConstant(1);
+    spv::Id ci2 = builder_->makeIntConstant(2);
+    spv::Id ci3 = builder_->makeIntConstant(3);
+    auto load_v = [&](spv::Id var, spv::Id index) {
+      id_vector_temp_.assign(1, index);
+      return builder_->createLoad(
+          builder_->createAccessChain(spv::StorageClassFunction, var,
+                                      id_vector_temp_),
+          spv::NoPrecision);
+    };
+    // Compare edges in normalized-device (post-perspective-divide) screen space
+    // so the diagonal pick is correct when the guest vertices have differing W.
+    auto ndc_xy = [&](spv::Id p) {
+      spv::Id px = builder_->createCompositeExtract(p, type_float_, 0);
+      spv::Id py = builder_->createCompositeExtract(p, type_float_, 1);
+      spv::Id pw = builder_->createCompositeExtract(p, type_float_, 3);
+      spv::Id inv_w =
+          builder_->createBinOp(spv::OpFDiv, type_float_, const_float_1_, pw);
+      id_vector_temp_.assign(
+          {builder_->createBinOp(spv::OpFMul, type_float_, px, inv_w),
+           builder_->createBinOp(spv::OpFMul, type_float_, py, inv_w)});
+      return builder_->createCompositeConstruct(type_float2_, id_vector_temp_);
+    };
+    spv::Id q0 = ndc_xy(load_v(var_rect_v_position_, ci0));
+    spv::Id q1 = ndc_xy(load_v(var_rect_v_position_, ci1));
+    spv::Id q2 = ndc_xy(load_v(var_rect_v_position_, ci2));
+    auto edge_len2 = [&](spv::Id a, spv::Id b) {
+      spv::Id d = builder_->createBinOp(spv::OpFSub, type_float2_, a, b);
+      spv::Id dx = builder_->createCompositeExtract(d, type_float_, 0);
+      spv::Id dy = builder_->createCompositeExtract(d, type_float_, 1);
+      return builder_->createBinOp(
+          spv::OpFAdd, type_float_,
+          builder_->createBinOp(spv::OpFMul, type_float_, dx, dx),
+          builder_->createBinOp(spv::OpFMul, type_float_, dy, dy));
+    };
+    spv::Id l12 = edge_len2(q1, q2);  // opposite vertex 0
+    spv::Id l20 = edge_len2(q2, q0);  // opposite vertex 1
+    spv::Id l01 = edge_len2(q0, q1);  // opposite vertex 2
+    spv::Id apex0 = builder_->createBinOp(
+        spv::OpLogicalAnd, type_bool_,
+        builder_->createBinOp(spv::OpFOrdGreaterThanEqual, type_bool_, l12, l20),
+        builder_->createBinOp(spv::OpFOrdGreaterThanEqual, type_bool_, l12,
+                              l01));
+    spv::Id apex1 = builder_->createBinOp(
+        spv::OpLogicalAnd, type_bool_,
+        builder_->createUnaryOp(spv::OpLogicalNot, type_bool_, apex0),
+        builder_->createBinOp(spv::OpFOrdGreaterThanEqual, type_bool_, l20,
+                              l01));
+    // Strip-slot -> guest-vertex indices: slot0 = apex, slot1 = (apex+1)%3,
+    // slot2 = (apex+2)%3.
+    spv::Id slot0_idx = builder_->createTriOp(
+        spv::OpSelect, type_int_, apex0, ci0,
+        builder_->createTriOp(spv::OpSelect, type_int_, apex1, ci1, ci2));
+    auto add_mod3 = [&](spv::Id idx, spv::Id addend) {
+      spv::Id sum = builder_->createBinOp(spv::OpIAdd, type_int_, idx, addend);
+      return builder_->createTriOp(
+          spv::OpSelect, type_int_,
+          builder_->createBinOp(spv::OpSGreaterThanEqual, type_bool_, sum, ci3),
+          builder_->createBinOp(spv::OpISub, type_int_, sum, ci3), sum);
+    };
+    spv::Id slot1_idx = add_mod3(slot0_idx, ci1);
+    spv::Id slot2_idx = add_mod3(slot0_idx, ci2);
+    spv::Id corner_is_0 =
+        builder_->createBinOp(spv::OpIEqual, type_bool_, rect_corner_int_, ci0);
+    spv::Id corner_is_1 =
+        builder_->createBinOp(spv::OpIEqual, type_bool_, rect_corner_int_, ci1);
+    spv::Id corner_is_2 =
+        builder_->createBinOp(spv::OpIEqual, type_bool_, rect_corner_int_, ci2);
+
+    auto resolve = [&](spv::Id var, spv::Id type, bool is_vec) {
+      spv::Id s0 = load_v(var, slot0_idx);
+      spv::Id s1 = load_v(var, slot1_idx);
+      spv::Id s2 = load_v(var, slot2_idx);
+      spv::Id s3 = builder_->createBinOp(
+          spv::OpFSub, type, builder_->createBinOp(spv::OpFAdd, type, s1, s2),
+          s0);
+      spv::Id c0 = is_vec ? builder_->smearScalar(spv::NoPrecision, corner_is_0,
+                                                  type_bool4_)
+                          : corner_is_0;
+      spv::Id c1 = is_vec ? builder_->smearScalar(spv::NoPrecision, corner_is_1,
+                                                  type_bool4_)
+                          : corner_is_1;
+      spv::Id c2 = is_vec ? builder_->smearScalar(spv::NoPrecision, corner_is_2,
+                                                  type_bool4_)
+                          : corner_is_2;
+      spv::Id r = builder_->createTriOp(spv::OpSelect, type, c2, s2, s3);
+      r = builder_->createTriOp(spv::OpSelect, type, c1, s1, r);
+      r = builder_->createTriOp(spv::OpSelect, type, c0, s0, r);
+      return r;
+    };
+
+    // 1. Position:
+    builder_->createStore(resolve(var_rect_v_position_, type_float4_, true),
+                          position_ptr);
+
+    // 2. Interpolators:
+    interpolators_remaining = GetModificationInterpolatorMask();
+    while (xe::bit_scan_forward(interpolators_remaining, &interpolator_index)) {
+      interpolators_remaining &= ~(UINT32_C(1) << interpolator_index);
+      builder_->createStore(
+          resolve(var_rect_v_interpolators_[interpolator_index], type_float4_,
+                  true),
+          input_output_interpolators_[interpolator_index]);
+    }
+
+    // 3. Clip Distances:
+    for (size_t k = 0; k < var_rect_v_clip_distance_.size(); ++k) {
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(builder_->makeIntConstant(
+          int(output_per_vertex_clip_distance_member_index_)));
+      id_vector_temp_.push_back(builder_->makeIntConstant(int(k)));
+      builder_->createStore(
+          resolve(var_rect_v_clip_distance_[k], type_float_, false),
+          builder_->createAccessChain(spv::StorageClassOutput, output_per_vertex_,
+                                      id_vector_temp_));
+    }
+
+    // 4. Cull Distances:
+    for (size_t k = 0; k < var_rect_v_cull_distance_.size(); ++k) {
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(builder_->makeIntConstant(
+          int(output_per_vertex_cull_distance_member_index_)));
+      id_vector_temp_.push_back(builder_->makeIntConstant(int(k)));
+      builder_->createStore(
+          resolve(var_rect_v_cull_distance_[k], type_float_, false),
+          builder_->createAccessChain(spv::StorageClassOutput, output_per_vertex_,
+                                      id_vector_temp_));
+    }
+
+    // 5. Point Size:
+    if (output_point_size_ != spv::NoResult &&
+        var_rect_v_point_size_ != spv::NoResult) {
+      builder_->createStore(
+          resolve(var_rect_v_point_size_, type_float_, false), output_point_size_);
+    }
   }
 
   // End the main function.
@@ -1482,6 +1918,9 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
 
 void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
   Modification shader_modification = GetSpirvShaderModification();
+  bool is_rect_vs =
+      (shader_modification.vertex.host_vertex_shader_type ==
+       Shader::HostVertexShaderType::kRectangleListAsTriangleStrip);
 
   // The edge flag isn't used for any purpose by the translator.
   if (current_shader().writes_point_size_edge_flag_kill_vertex() & 0b101) {
@@ -1498,6 +1937,100 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
         spv::NoPrecision, spv::StorageClassFunction, type_float3_,
         "xe_var_point_size_edge_flag_kill_vertex",
         builder_->makeCompositeConstant(type_float3_, id_vector_temp_));
+  }
+
+  // Check if memory export should be allowed for this host vertex of the guest
+  // primitive to make sure export is done only once for each guest vertex.
+  if (IsMemoryExportUsed()) {
+    spv::Id memexport_allowed_for_host_vertex_of_guest_primitive =
+        spv::NoResult;
+    if (shader_modification.vertex.host_vertex_shader_type ==
+        Shader::HostVertexShaderType::kPointListAsTriangleStrip) {
+      // Only for one host vertex for the point.
+      memexport_allowed_for_host_vertex_of_guest_primitive =
+          builder_->createBinOp(
+              spv::OpIEqual, type_bool_,
+              builder_->createBinOp(
+                  spv::OpBitwiseAnd, type_uint_,
+                  builder_->createUnaryOp(
+                      spv::OpBitcast, type_uint_,
+                      builder_->createLoad(input_vertex_index_,
+                                           spv::NoPrecision)),
+                  builder_->makeUintConstant(3)),
+              const_uint_0_);
+    } else if (shader_modification.vertex.host_vertex_shader_type ==
+               Shader::HostVertexShaderType::kRectangleListAsTriangleStrip) {
+      // The rect loop now runs all 3 guest vertices for every host corner (the
+      // synthetic 4th corner is built from a reordering that isn't known until
+      // all 3 positions are transformed). Gate export to the single iteration
+      // that owns this corner's real guest vertex - the flag is updated in the
+      // loop body and ANDed in by ExportToMemory.
+      var_rect_memexport_ok_ = builder_->createVariable(
+          spv::NoPrecision, spv::StorageClassFunction, type_bool_,
+          "xe_var_rect_memexport_ok", builder_->makeBoolConstant(false));
+    }
+
+    if (memexport_allowed_for_host_vertex_of_guest_primitive != spv::NoResult) {
+      main_memexport_allowed_ =
+          main_memexport_allowed_ != spv::NoResult
+              ? builder_->createBinOp(
+                    spv::OpLogicalAnd, type_bool_, main_memexport_allowed_,
+                    memexport_allowed_for_host_vertex_of_guest_primitive)
+              : memexport_allowed_for_host_vertex_of_guest_primitive;
+    }
+  }
+
+  if (is_rect_vs) {
+    spv::Id raw_vertex_index = builder_->createUnaryOp(
+        spv::OpBitcast, type_uint_,
+        builder_->createLoad(input_vertex_index_, spv::NoPrecision));
+    spv::Id corner = builder_->createBinOp(
+        spv::OpBitwiseAnd, type_uint_, raw_vertex_index,
+        builder_->makeUintConstant(3));
+    rect_is_corner_3_ = builder_->createBinOp(
+        spv::OpIEqual, type_bool_, corner, builder_->makeUintConstant(3));
+    rect_corner_int_ =
+        builder_->createUnaryOp(spv::OpBitcast, type_int_, corner);
+    // Always transform all 3 guest vertices (iterations 0..2): the strip's
+    // shared edge must be the rectangle's diagonal, which requires reordering
+    // the 3 guest vertices, and that isn't known until every position exists.
+    rect_end_i_ = builder_->makeIntConstant(3);
+
+    builder_->createStore(const_int_0_, var_rect_loop_i_);
+    builder_->createStore(const_float4_0_, var_rect_acc_position_);
+    uint32_t interpolators_remaining = GetModificationInterpolatorMask();
+    uint32_t interpolator_index;
+    while (xe::bit_scan_forward(interpolators_remaining, &interpolator_index)) {
+      interpolators_remaining &= ~(UINT32_C(1) << interpolator_index);
+      builder_->createStore(const_float4_0_,
+                            var_rect_acc_interpolators_[interpolator_index]);
+    }
+    for (spv::Id clip_acc : var_rect_acc_clip_distance_) {
+      builder_->createStore(const_float_0_, clip_acc);
+    }
+    for (spv::Id cull_acc : var_rect_acc_cull_distance_) {
+      builder_->createStore(const_float_0_, cull_acc);
+    }
+    if (var_rect_acc_point_size_ != spv::NoResult) {
+      builder_->createStore(const_float_0_, var_rect_acc_point_size_);
+    }
+
+    // Open the rectangle vertex loop.
+    rect_loop_header_ = &builder_->makeNewBlock();
+    spv::Block& rect_loop_body = builder_->makeNewBlock();
+    rect_loop_continue_ =
+        new spv::Block(builder_->getUniqueId(), *function_main_);
+    rect_loop_merge_ =
+        new spv::Block(builder_->getUniqueId(), *function_main_);
+    builder_->createBranch(rect_loop_header_);
+
+    builder_->setBuildPoint(rect_loop_header_);
+    uint_vector_temp_.clear();
+    builder_->createLoopMerge(rect_loop_merge_, rect_loop_continue_,
+                              spv::LoopControlDontUnrollMask,
+                              uint_vector_temp_);
+    builder_->createBranch(&rect_loop_body);
+    builder_->setBuildPoint(&rect_loop_body);
   }
 
   // Zero general-purpose registers to prevent crashes when the game
@@ -1522,37 +2055,34 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
     }
   }
 
-  // TODO(Triang3l): For HostVertexShaderType::kRectangeListAsTriangleStrip,
-  // start the vertex loop, and load the index there.
-
-  // Check if memory export should be allowed for this host vertex of the guest
-  // primitive to make sure export is done only once for each guest vertex.
-  if (IsMemoryExportUsed()) {
-    spv::Id memexport_allowed_for_host_vertex_of_guest_primitive =
-        spv::NoResult;
-    if (shader_modification.vertex.host_vertex_shader_type ==
-        Shader::HostVertexShaderType::kPointListAsTriangleStrip) {
-      // Only for one host vertex for the point.
-      memexport_allowed_for_host_vertex_of_guest_primitive =
-          builder_->createBinOp(
-              spv::OpIEqual, type_bool_,
-              builder_->createBinOp(
-                  spv::OpBitwiseAnd, type_uint_,
-                  builder_->createUnaryOp(
-                      spv::OpBitcast, type_uint_,
-                      builder_->createLoad(input_vertex_index_,
-                                           spv::NoPrecision)),
-                  builder_->makeUintConstant(3)),
-              const_uint_0_);
+  if (is_rect_vs) {
+    builder_->createStore(builder_->makeBoolConstant(false),
+                          var_main_predicate_);
+    builder_->createStore(const_uint4_0_, var_main_loop_count_);
+    builder_->createStore(const_int_0_, var_main_address_register_);
+    builder_->createStore(const_int4_0_, var_main_loop_address_);
+    builder_->createStore(const_float_0_, var_main_previous_scalar_);
+    builder_->createStore(const_int_0_, var_main_vfetch_address_);
+    builder_->createStore(const_int_0_, var_main_vfetch_bound_);
+    if (var_main_point_size_edge_flag_kill_vertex_ != spv::NoResult) {
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(builder_->makeFloatConstant(-1.0f));
+      id_vector_temp_.push_back(const_float_0_);
+      id_vector_temp_.push_back(const_float_0_);
+      builder_->createStore(
+          builder_->makeCompositeConstant(type_float3_, id_vector_temp_),
+          var_main_point_size_edge_flag_kill_vertex_);
     }
-
-    if (memexport_allowed_for_host_vertex_of_guest_primitive != spv::NoResult) {
-      main_memexport_allowed_ =
-          main_memexport_allowed_ != spv::NoResult
-              ? builder_->createBinOp(
-                    spv::OpLogicalAnd, type_bool_, main_memexport_allowed_,
-                    memexport_allowed_for_host_vertex_of_guest_primitive)
-              : memexport_allowed_for_host_vertex_of_guest_primitive;
+    if (var_main_memexport_address_ != spv::NoResult) {
+      builder_->createStore(const_float4_0_, var_main_memexport_address_);
+      uint8_t memexport_eM_remaining = current_shader().memexport_eM_written();
+      uint32_t memexport_eM_index;
+      while (xe::bit_scan_forward(memexport_eM_remaining, &memexport_eM_index)) {
+        memexport_eM_remaining &= ~(uint8_t(1) << memexport_eM_index);
+        builder_->createStore(const_float4_0_,
+                              var_main_memexport_data_[memexport_eM_index]);
+      }
+      builder_->createStore(const_uint_0_, var_main_memexport_data_written_);
     }
   }
 
@@ -1775,18 +2305,51 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
         }
       }
     } else if (IsSpirvVertexShader()) {
-      spv::Id vertex_index = builder_->createUnaryOp(
-          spv::OpBitcast, type_uint_,
-          builder_->createLoad(input_vertex_index_, spv::NoPrecision));
+      spv::Id vertex_index;
       if (shader_modification.vertex.host_vertex_shader_type ==
-          Shader::HostVertexShaderType::kPointListAsTriangleStrip) {
+          Shader::HostVertexShaderType::kRectangleListAsTriangleStrip) {
+        spv::Id raw_vertex_index = builder_->createUnaryOp(
+            spv::OpBitcast, type_uint_,
+            builder_->createLoad(input_vertex_index_, spv::NoPrecision));
+        spv::Id rect_id = builder_->createBinOp(
+            spv::OpShiftRightLogical, type_uint_, raw_vertex_index,
+            builder_->makeUintConstant(2));
+        spv::Id rect_id_x3 = builder_->createBinOp(
+            spv::OpIMul, type_uint_, rect_id, builder_->makeUintConstant(3));
+        spv::Id current_i =
+            builder_->createLoad(var_rect_loop_i_, spv::NoPrecision);
+        vertex_index = builder_->createBinOp(
+            spv::OpIAdd, type_uint_, rect_id_x3,
+            builder_->createUnaryOp(spv::OpBitcast, type_uint_, current_i));
+        if (var_rect_memexport_ok_ != spv::NoResult) {
+          // This iteration owns the export for the real guest vertex only when
+          // it is the one this host corner represents (corner 3 -> never, since
+          // rect_corner_int_ == 3 and current_i is only 0..2).
+          builder_->createStore(
+              builder_->createBinOp(spv::OpIEqual, type_bool_, current_i,
+                                    rect_corner_int_),
+              var_rect_memexport_ok_);
+        }
+      } else if (shader_modification.vertex.host_vertex_shader_type ==
+                 Shader::HostVertexShaderType::kPointListAsTriangleStrip) {
         // Load the point index, autogenerated or indirectly from the index
         // buffer.
         // Extract the primitive index from the two-triangle strip vertex index.
         spv::Id const_uint_2 = builder_->makeUintConstant(2);
+        vertex_index = builder_->createUnaryOp(
+            spv::OpBitcast, type_uint_,
+            builder_->createLoad(input_vertex_index_, spv::NoPrecision));
         vertex_index = builder_->createBinOp(
             spv::OpShiftRightLogical, type_uint_, vertex_index, const_uint_2);
-        // Check if the index needs to be loaded from the index buffer.
+      } else {
+        vertex_index = builder_->createUnaryOp(
+            spv::OpBitcast, type_uint_,
+            builder_->createLoad(input_vertex_index_, spv::NoPrecision));
+      }
+      if (shader_modification.vertex.host_vertex_shader_type ==
+              Shader::HostVertexShaderType::kPointListAsTriangleStrip ||
+          shader_modification.vertex.host_vertex_shader_type ==
+              Shader::HostVertexShaderType::kRectangleListAsTriangleStrip) {
         spv::Id load_vertex_index = builder_->createBinOp(
             spv::OpINotEqual, type_bool_,
             builder_->createBinOp(
@@ -1798,6 +2361,7 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
             load_vertex_index, spv::SelectionControlDontFlattenMask, *builder_);
         spv::Id loaded_vertex_index;
         {
+          spv::Id const_uint_2 = builder_->makeUintConstant(2);
           // Check if the index is 32-bit.
           spv::Id vertex_index_is_32bit = builder_->createBinOp(
               spv::OpINotEqual, type_bool_,

@@ -144,21 +144,19 @@ add_library(fmt STATIC
 target_include_directories(fmt PUBLIC fmt/include)
 
 # ==============================================================================
-# glslang-spirv (not needed on macOS — no Vulkan/SPIR-V backend)
+# glslang-spirv
 # ==============================================================================
-if(NOT APPLE)
-  file(GLOB _glslang_spirv_cpp "glslang/SPIRV/*.cpp")
-  file(GLOB _glslang_spirv_h "glslang/SPIRV/*.h")
-  file(GLOB _glslang_spirv_hpp "glslang/SPIRV/*.hpp11")
-  list(FILTER _glslang_spirv_cpp EXCLUDE REGEX "GlslangToSpv\\.cpp$")
-  add_library(glslang-spirv STATIC
-    ${_glslang_spirv_cpp}
-    ${_glslang_spirv_h}
-    ${_glslang_spirv_hpp}
-    glslang/glslang/Include/visibility.h
-  )
-  target_include_directories(glslang-spirv PUBLIC glslang)
-endif()
+file(GLOB _glslang_spirv_cpp "glslang/SPIRV/*.cpp")
+file(GLOB _glslang_spirv_h "glslang/SPIRV/*.h")
+file(GLOB _glslang_spirv_hpp "glslang/SPIRV/*.hpp11")
+list(FILTER _glslang_spirv_cpp EXCLUDE REGEX "GlslangToSpv\\.cpp$")
+add_library(glslang-spirv STATIC
+  ${_glslang_spirv_cpp}
+  ${_glslang_spirv_h}
+  ${_glslang_spirv_hpp}
+  glslang/glslang/Include/visibility.h
+)
+target_include_directories(glslang-spirv PUBLIC glslang)
 
 # ==============================================================================
 # imgui
@@ -772,10 +770,12 @@ endif()
 if(XE_TARGET_AARCH64)
   if(XE_HAS_GAS_ASM)
     target_sources(libavcodec PRIVATE
+      FFmpeg/libavcodec/aarch64/fdctdsp_init_aarch64.c
       FFmpeg/libavcodec/aarch64/idctdsp_init_aarch64.c
       FFmpeg/libavcodec/aarch64/mpegaudiodsp_init.c
     )
     xe_add_gas_sources(libavcodec
+      FFmpeg/libavcodec/aarch64/fdctdsp_neon.S
       FFmpeg/libavcodec/aarch64/idctdsp_neon.S
       FFmpeg/libavcodec/aarch64/mpegaudiodsp_neon.S
       FFmpeg/libavcodec/aarch64/simple_idct_neon.S

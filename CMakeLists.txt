@@ -7,6 +7,10 @@ else()
   project(xenia LANGUAGES C CXX)
 endif()
 
+if(APPLE)
+  include_directories(SYSTEM "/opt/homebrew/include" "/opt/homebrew/include/SDL2")
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 17)
@@ -90,6 +94,8 @@ include_directories(
   ${PROJECT_SOURCE_DIR}
   ${PROJECT_SOURCE_DIR}/src
   ${CMAKE_BINARY_DIR}
+  ${PROJECT_SOURCE_DIR}/third_party/Vulkan-Headers/include
+  ${PROJECT_SOURCE_DIR}/third_party/glslang
 )
 # Third-party headers as SYSTEM to suppress warnings under -Werror
 include_directories(SYSTEM
@@ -237,13 +243,22 @@ else()
     add_compile_options(
       $<$<COMPILE_LANGUAGE:CXX>:-Wno-shorten-64-to-32>
       -Wno-deprecated-declarations
-      -Wno-character-conversion
+      -Wno-error
+      -Wno-format
     )
-    add_link_options(-Wl,-no_warn_duplicate_libraries)
+    # GTK3 via pkg-config
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(GTK3 REQUIRED gtk+-3.0)
+    include_directories(${GTK3_INCLUDE_DIRS})
+    link_directories(${GTK3_LIBRARY_DIRS})
+    add_compile_options(${GTK3_CFLAGS_OTHER})
+    add_link_options(-Wl,-all_load)
     link_libraries(
       "-framework CoreFoundation"
       "-framework Foundation"
       "-framework IOKit"
+      ${GTK3_LIBRARIES}
+      iconv
       dl
       pthread
     )
@@ -265,9 +280,11 @@ else()
 
   # --- Per-configuration flags ---
   # Checked
-  string(APPEND CMAKE_C_FLAGS_CHECKED " -fsanitize=address")
-  string(APPEND CMAKE_CXX_FLAGS_CHECKED " -fsanitize=address")
-  string(APPEND CMAKE_EXE_LINKER_FLAGS_CHECKED " -fsanitize=address")
+  if(NOT APPLE)
+    string(APPEND CMAKE_C_FLAGS_CHECKED " -fsanitize=address")
+    string(APPEND CMAKE_CXX_FLAGS_CHECKED " -fsanitize=address")
+    string(APPEND CMAKE_EXE_LINKER_FLAGS_CHECKED " -fsanitize=address")
+  endif()
   add_compile_definitions(
     $<$<CONFIG:Checked>:DEBUG>
   )
@@ -290,18 +307,20 @@ else()
     $<$<CONFIG:Release>:_NO_DEBUG_HEAP=1>
   )
   add_compile_options($<$<CONFIG:Release>:-O3>)
-  # Link-time optimization (use lld and llvm-ar/ranlib to avoid system
-  # linker/archiver LTO plugin version mismatch with clang's bitcode)
-  add_compile_options($<$<CONFIG:Release>:-flto=thin>)
-  add_link_options($<$<CONFIG:Release>:-flto=thin>)
-  add_link_options($<$<CONFIG:Release>:-fuse-ld=lld>)
-  find_program(LLVM_AR NAMES llvm-ar)
-  find_program(LLVM_RANLIB NAMES llvm-ranlib)
-  if(LLVM_AR)
-    set(CMAKE_AR "${LLVM_AR}" CACHE FILEPATH "" FORCE)
-  endif()
-  if(LLVM_RANLIB)
-    set(CMAKE_RANLIB "${LLVM_RANLIB}" CACHE FILEPATH "" FORCE)
+  if(NOT APPLE)
+    # Link-time optimization (use lld and llvm-ar/ranlib to avoid system
+    # linker/archiver LTO plugin version mismatch with clang's bitcode)
+    add_compile_options($<$<CONFIG:Release>:-flto=thin>)
+    add_link_options($<$<CONFIG:Release>:-flto=thin>)
+    add_link_options($<$<CONFIG:Release>:-fuse-ld=lld>)
+    find_program(LLVM_AR NAMES llvm-ar)
+    find_program(LLVM_RANLIB NAMES llvm-ranlib)
+    if(LLVM_AR)
+      set(CMAKE_AR "${LLVM_AR}" CACHE FILEPATH "" FORCE)
+    endif()
+    if(LLVM_RANLIB)
+      set(CMAKE_RANLIB "${LLVM_RANLIB}" CACHE FILEPATH "" FORCE)
+    endif()
   endif()
   # No symbols in release on non-Windows
   string(REPLACE "-g" "" CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE}")

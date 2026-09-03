@@ -181,8 +181,8 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
                 }
               }
 #endif
-#if XE_PLATFORM_LINUX
-              // Linux: Use simplified timing logic to avoid oversleeping
+#if XE_PLATFORM_LINUX || XE_PLATFORM_MAC
+              // POSIX/macOS: Use simplified timing logic to avoid oversleeping
               MarkVblank();
 
               if (cvars::vsync || normalized_framerate_limit > 0) {
@@ -211,6 +211,20 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
   }
 
   return X_STATUS_SUCCESS;
+}
+
+bool GraphicsSystem::InitializeOffscreenPresenter() {
+  if (presenter_) {
+    return true;
+  }
+  if (!provider_) {
+    return false;
+  }
+  presenter_ = provider_->CreatePresenter(
+      [this](bool is_responsible, bool statically_from_ui_thread) {
+        OnHostGpuLossFromAnyThread(is_responsible);
+      });
+  return presenter_ != nullptr;
 }
 
 void GraphicsSystem::Shutdown() {

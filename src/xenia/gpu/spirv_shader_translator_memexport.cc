@@ -33,6 +33,19 @@ void SpirvShaderTranslator::ExportToMemory(uint8_t export_eM) {
   std::optional<SpirvBuilder::IfBuilder> if_memexport_allowed;
   spv::Id memexport_allowed = main_memexport_allowed_;
 
+  // Rectangle-list VS expansion runs the guest shader for all 3 guest vertices
+  // on every host corner; only the iteration that owns this corner's guest
+  // vertex may export (see var_rect_memexport_ok_).
+  if (var_rect_memexport_ok_ != spv::NoResult) {
+    spv::Id rect_memexport_ok =
+        builder_->createLoad(var_rect_memexport_ok_, spv::NoPrecision);
+    memexport_allowed =
+        memexport_allowed != spv::NoResult
+            ? builder_->createBinOp(spv::OpLogicalAnd, type_bool_,
+                                    memexport_allowed, rect_memexport_ok)
+            : rect_memexport_ok;
+  }
+
   // For pixel shaders with resolution scaling, only allow memory export from
   // the center host pixel to avoid duplicate exports.
   if (is_pixel_shader() && (GetCurrentDrawResolutionScaleX() > 1 ||
