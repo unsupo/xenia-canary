@@ -1767,9 +1767,9 @@ void SpirvShaderTranslator::DeclareDivergentGatherBuffer() {
       "xe_divergent_gather");
   builder_->addDecoration(buffer_divergent_gather_,
                           spv::DecorationDescriptorSet,
-                          int(kDescriptorSetConstants));
+                          int(kDescriptorSetSharedMemoryAndEdram));
   builder_->addDecoration(buffer_divergent_gather_, spv::DecorationBinding,
-                          int(kConstantBufferDivergentGather));
+                          int(kDivergentGatherSharedMemorySetBinding));
   if (features_.spirv_version >= spv::Spv_1_4) {
     main_interface_.push_back(buffer_divergent_gather_);
   }
@@ -1989,9 +1989,12 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
 
   if (IsDivergentGatherPrepass()) {
     // gl_VertexIndex stand-in for the compute pre-pass: gl_GlobalInvocationID.x.
-    // Everything downstream (vertex fetch, the gather stores) then works exactly
-    // like the real vertex shader, so the gather slot for a given ordinal
-    // matches between the two.
+    // The rest of this function (the vertex index endian swap / base add / r0.x
+    // write) then runs exactly like the real vertex shader, so vertex fetch -
+    // and therefore the a0 computation and the gather slot for a given ordinal -
+    // matches between the pre-pass and the real vertex shader. Only valid for
+    // non-indexed draws, where gl_VertexIndex == the sequential vertex ordinal
+    // (enforced by the command processor).
     input_vertex_index_ =
         builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction,
                                  type_int_, "xe_vertex_index");
@@ -2003,7 +2006,6 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
                                      spv::NoPrecision),
                 type_uint_, 0)),
         input_vertex_index_);
-    return;
   }
 
   bool is_rect_vs =

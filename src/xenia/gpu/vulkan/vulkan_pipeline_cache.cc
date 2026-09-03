@@ -320,6 +320,14 @@ void VulkanPipelineCache::Shutdown() {
     }
   }
   pipelines_.clear();
+  for (const auto& divergent_gather_pipeline_pair :
+       divergent_gather_compute_pipelines_) {
+    if (divergent_gather_pipeline_pair.second != VK_NULL_HANDLE) {
+      dfn.vkDestroyPipeline(device, divergent_gather_pipeline_pair.second,
+                            nullptr);
+    }
+  }
+  divergent_gather_compute_pipelines_.clear();
 
   // Destroy the pipeline cache.
   if (vk_pipeline_cache_ != VK_NULL_HANDLE) {
@@ -591,6 +599,48 @@ bool VulkanPipelineCache::EnsureShadersTranslated(
     }
   }
   return true;
+}
+
+VkPipeline VulkanPipelineCache::GetOrCreateDivergentGatherComputePipeline(
+    VulkanShader::VulkanTranslation* vertex_shader,
+    VkPipelineLayout pipeline_layout) {
+  assert_true(vertex_shader->is_translated() && vertex_shader->is_valid());
+  SpirvShaderTranslator::Modification prepass_modification(
+      vertex_shader->modification());
+  prepass_modification.vertex.divergent_gather_prepass = 1;
+  auto found = divergent_gather_compute_pipelines_.find(
+      prepass_modification.value);
+  if (found != divergent_gather_compute_pipelines_.end()) {
+    return found->second;
+  }
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  auto& vulkan_shader = static_cast<VulkanShader&>(vertex_shader->shader());
+  auto* prepass_translation = static_cast<VulkanShader::VulkanTranslation*>(
+      vulkan_shader.GetOrCreateTranslation(prepass_modification.value));
+  if (prepass_translation) {
+    if (!prepass_translation->is_translated()) {
+      TranslateAnalyzedShader(*shader_translator_, *prepass_translation);
+    }
+    if (prepass_translation->is_valid()) {
+      VkShaderModule shader_module =
+          prepass_translation->GetOrCreateShaderModule();
+      if (shader_module != VK_NULL_HANDLE) {
+        pipeline = ui::vulkan::util::CreateComputePipeline(
+            command_processor_.GetVulkanDevice(), pipeline_layout,
+            shader_module);
+      }
+    }
+  }
+  if (pipeline == VK_NULL_HANDLE) {
+    XELOGE(
+        "Failed to create the divergent-float-constant gather compute pipeline "
+        "for vertex shader {:016X} - skinned characters may be invisible on "
+        "this draw",
+        vulkan_shader.ucode_data_hash());
+  }
+  divergent_gather_compute_pipelines_.emplace(prepass_modification.value,
+                                              pipeline);
+  return pipeline;
 }
 
 bool VulkanPipelineCache::ConfigurePipeline(

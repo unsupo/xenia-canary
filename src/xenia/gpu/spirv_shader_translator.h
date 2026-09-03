@@ -350,21 +350,27 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kConstantBufferFetch,
     kConstantBufferClipPlanes,
     kConstantBufferTessellation,
-    // MoltenVK divergent-float-constant workaround: a storage buffer with a
-    // runtime array of vec4, kDivergentGatherMaxReads slots per vertex. Filled
-    // by the compute pre-pass (Modification.vertex.divergent_gather_prepass),
-    // read with an affine index by the real vertex shader. Only referenced by
-    // `kVertex` shaders that dynamically index the float constants, when the
-    // workaround feature is active.
-    kConstantBufferDivergentGather,
 
     kConstantBufferCount,
   };
 
-  // Max number of address-register-relative float constant reads a shader may
-  // have to be eligible for the MoltenVK divergent gather workaround, and the
-  // per-vertex stride (in vec4s) of the gather buffer.
+  // MoltenVK divergent-float-constant workaround (see
+  // Features::divergent_float_constant_workaround). The gather buffer is a
+  // storage buffer with a runtime array of vec4, kDivergentGatherMaxReads slots
+  // per vertex, filled by the compute pre-pass
+  // (Modification.vertex.divergent_gather_prepass) and read with an affine index
+  // by the real vertex shader. It lives in the shared-memory/EDRAM descriptor
+  // set (kDescriptorSetSharedMemoryAndEdram), at the binding after shared
+  // memory - the EDRAM FSI bindings are never present at the same time as this
+  // one (the workaround only runs on the MoltenVK FBO path).
+  static constexpr uint32_t kDivergentGatherSharedMemorySetBinding = 1;
+  // Max number of address-register-relative float constant reads resolved into
+  // the gather buffer per vertex (the per-vertex stride, in vec4s); reads past
+  // this fall back to the direct (Metal-broken) read.
   static constexpr uint32_t kDivergentGatherMaxReads = 32;
+  // Upper bound on the vertex ordinal (gl_VertexIndex) the gather buffer is
+  // sized for - draws that could exceed it don't get the workaround.
+  static constexpr uint32_t kDivergentGatherMaxVertices = 65536;
   static constexpr uint32_t kDivergentGatherComputeGroupSize = 64;
 
   // The minimum limit for maxPerStageDescriptorStorageBuffers is 4, and for
@@ -678,6 +684,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
   uint32_t GetModificationInterpolatorMask() const {
     Modification modification = GetSpirvShaderModification();
+    // The MoltenVK divergent-gather compute pre-pass has no interpolator
+    // outputs - it only fills the gather buffer.
+    if (IsDivergentGatherPrepass()) {
+      return 0;
+    }
     return is_vertex_shader() ? modification.vertex.interpolator_mask
                               : modification.pixel.interpolator_mask;
   }

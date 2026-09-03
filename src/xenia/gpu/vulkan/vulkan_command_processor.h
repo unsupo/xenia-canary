@@ -655,6 +655,22 @@ class VulkanCommandProcessor final : public CommandProcessor {
   VkDescriptorPool shared_memory_and_edram_descriptor_pool_ = VK_NULL_HANDLE;
   VkDescriptorSet shared_memory_and_edram_descriptor_set_;
 
+  // MoltenVK divergent-float-constant workaround (--divergent_float_constant_gather).
+  // Metal vertex functions return float4(0) for a per-vertex data-dependent
+  // divergent resource index, collapsing GPU skinning. When active, a compute
+  // pre-pass resolves the a0-relative float constant reads of a skinned vertex
+  // shader into this buffer, bound at
+  // kDivergentGatherSharedMemorySetBinding in the shared-memory/EDRAM set, which
+  // the real vertex shader then reads with an affine index. Only set up on the
+  // MoltenVK FBO path.
+  bool divergent_gather_supported_ = false;
+  VkBuffer divergent_gather_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory divergent_gather_buffer_memory_ = VK_NULL_HANDLE;
+  // Layout for the pre-pass compute pipelines: set 0 = shared memory / EDRAM /
+  // gather buffer, set 1 = guest draw constants. Compatible with the graphics
+  // pipeline layouts for those two sets.
+  VkPipelineLayout divergent_gather_pipeline_layout_ = VK_NULL_HANDLE;
+
   // Bytes 0x0...0x3FF - 256-entry gamma ramp table with B10G10R10X2 data (read
   // as R10G10B10X2 with swizzle).
   // Bytes 0x400...0x9FF - 128-entry PWL R16G16 gamma ramp (R - base, G - delta,

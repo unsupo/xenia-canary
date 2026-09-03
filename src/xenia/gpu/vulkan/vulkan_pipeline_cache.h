@@ -139,6 +139,15 @@ class VulkanPipelineCache {
 
   bool EnsureShadersTranslated(VulkanShader::VulkanTranslation* vertex_shader,
                                VulkanShader::VulkanTranslation* pixel_shader);
+
+  // MoltenVK divergent-float-constant workaround: gets (translating and creating
+  // on first use) the compute pipeline that fills the divergent gather buffer
+  // for the given already-translated skinned vertex shader. `pipeline_layout`
+  // must expose descriptor sets 0 (shared memory / EDRAM / gather) and 1 (guest
+  // draw constants). Returns VK_NULL_HANDLE if the pre-pass can't be built.
+  VkPipeline GetOrCreateDivergentGatherComputePipeline(
+      VulkanShader::VulkanTranslation* vertex_shader,
+      VkPipelineLayout pipeline_layout);
   bool ConfigurePipeline(
       VulkanShader::VulkanTranslation* vertex_shader,
       VulkanShader::VulkanTranslation* pixel_shader,
@@ -472,6 +481,12 @@ class VulkanPipelineCache {
   // Adaptive mode (per-edge factors from index buffer).
   VkShaderModule adaptive_triangle_hs_ = VK_NULL_HANDLE;
   VkShaderModule adaptive_quad_hs_ = VK_NULL_HANDLE;
+
+  // MoltenVK divergent-float-constant workaround: pre-pass modification value
+  // -> compute pipeline (VK_NULL_HANDLE if translation / creation failed).
+  std::unordered_map<uint64_t, VkPipeline,
+                     xe::hash::IdentityHasher<uint64_t>>
+      divergent_gather_compute_pipelines_;
 
   // Vulkan pipeline cache for faster pipeline creation.
   VkPipelineCache vk_pipeline_cache_ = VK_NULL_HANDLE;

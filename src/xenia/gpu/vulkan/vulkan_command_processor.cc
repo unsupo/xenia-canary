@@ -38,6 +38,7 @@
 
 DECLARE_bool(clear_memory_page_state);
 DECLARE_bool(readback_resolve_half_pixel_offset);
+DECLARE_bool(divergent_float_constant_gather);
 
 namespace xe {
 namespace gpu {
@@ -340,6 +341,14 @@ bool VulkanCommandProcessor::SetupContext() {
   bool edram_fragment_shader_interlock =
       render_target_cache_->GetPath() ==
       RenderTargetCache::Path::kPixelShaderInterlock;
+  // MoltenVK divergent-float-constant workaround: reuses shared-memory set
+  // binding kDivergentGatherSharedMemorySetBinding for the gather buffer. Never
+  // active at the same time as the EDRAM FSI bindings (that path is a
+  // fragment-shader-interlock path, this one is the FBO path forced on
+  // MoltenVK).
+  divergent_gather_supported_ =
+      !edram_fragment_shader_interlock &&
+      GetVulkanDevice()->properties().driverID == VK_DRIVER_ID_MOLTENVK;
   VkDescriptorSetLayoutBinding
       shared_memory_and_edram_descriptor_set_layout_bindings[3];
   shared_memory_and_edram_descriptor_set_layout_bindings[0].binding = 0;
@@ -382,6 +391,20 @@ bool VulkanCommandProcessor::SetupContext() {
     shared_memory_and_edram_descriptor_set_layout_bindings[2]
         .pImmutableSamplers = nullptr;
     shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount = 3;
+  } else if (divergent_gather_supported_) {
+    // MoltenVK divergent-float-constant gather buffer.
+    VkDescriptorSetLayoutBinding& gather_binding =
+        shared_memory_and_edram_descriptor_set_layout_bindings
+            [SpirvShaderTranslator::kDivergentGatherSharedMemorySetBinding];
+    gather_binding.binding =
+        SpirvShaderTranslator::kDivergentGatherSharedMemorySetBinding;
+    gather_binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    gather_binding.descriptorCount = 1;
+    gather_binding.stageFlags =
+        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
+    gather_binding.pImmutableSamplers = nullptr;
+    shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount =
+        SpirvShaderTranslator::kDivergentGatherSharedMemorySetBinding + 1;
   } else {
     shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount = 1;
   }
@@ -436,7 +459,8 @@ bool VulkanCommandProcessor::SetupContext() {
   descriptor_pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   descriptor_pool_sizes[0].descriptorCount =
       shared_memory_binding_count +
-      2u * uint32_t(edram_fragment_shader_interlock);
+      2u * uint32_t(edram_fragment_shader_interlock) +
+      uint32_t(divergent_gather_supported_);
   VkDescriptorPoolCreateInfo descriptor_pool_create_info;
   descriptor_pool_create_info.sType =
       VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -483,7 +507,8 @@ bool VulkanCommandProcessor::SetupContext() {
         shared_memory_binding_range * i;
     shared_memory_descriptor_buffer_info.range = shared_memory_binding_range;
   }
-  VkWriteDescriptorSet write_descriptor_sets[3];
+  VkWriteDescriptorSet write_descriptor_sets[4];
+  uint32_t write_descriptor_set_count = 1;
   VkWriteDescriptorSet& write_descriptor_set_shared_memory =
       write_descriptor_sets[0];
   write_descriptor_set_shared_memory.sType =
@@ -541,13 +566,74 @@ bool VulkanCommandProcessor::SetupContext() {
     write_descriptor_set_zpd_fsi_counter_init.pBufferInfo =
         &zpd_fsi_counter_descriptor_buffer_info;
     write_descriptor_set_zpd_fsi_counter_init.pTexelBufferView = nullptr;
+    write_descriptor_set_count = 3;
   }
-  dfn.vkUpdateDescriptorSets(device,
-                             1 + 2 * uint32_t(edram_fragment_shader_interlock),
+  // MoltenVK divergent-float-constant gather buffer (mutually exclusive with the
+  // EDRAM FSI bindings above).
+  VkDescriptorBufferInfo divergent_gather_descriptor_buffer_info;
+  if (divergent_gather_supported_) {
+    constexpr VkDeviceSize kDivergentGatherBufferSize =
+        VkDeviceSize(SpirvShaderTranslator::kDivergentGatherMaxVertices) *
+        SpirvShaderTranslator::kDivergentGatherMaxReads * sizeof(float) * 4;
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            GetVulkanDevice(), kDivergentGatherBufferSize,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            ui::vulkan::util::MemoryPurpose::kDeviceLocal,
+            divergent_gather_buffer_, divergent_gather_buffer_memory_)) {
+      XELOGE("Failed to create the divergent-float-constant gather buffer");
+      return false;
+    }
+    divergent_gather_descriptor_buffer_info.buffer = divergent_gather_buffer_;
+    divergent_gather_descriptor_buffer_info.offset = 0;
+    divergent_gather_descriptor_buffer_info.range = VK_WHOLE_SIZE;
+    VkWriteDescriptorSet& write_divergent_gather =
+        write_descriptor_sets[write_descriptor_set_count++];
+    write_divergent_gather.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write_divergent_gather.pNext = nullptr;
+    write_divergent_gather.dstSet = shared_memory_and_edram_descriptor_set_;
+    write_divergent_gather.dstBinding =
+        SpirvShaderTranslator::kDivergentGatherSharedMemorySetBinding;
+    write_divergent_gather.dstArrayElement = 0;
+    write_divergent_gather.descriptorCount = 1;
+    write_divergent_gather.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write_divergent_gather.pImageInfo = nullptr;
+    write_divergent_gather.pBufferInfo = &divergent_gather_descriptor_buffer_info;
+    write_divergent_gather.pTexelBufferView = nullptr;
+  }
+  dfn.vkUpdateDescriptorSets(device, write_descriptor_set_count,
                              write_descriptor_sets, 0, nullptr);
   if (edram_fragment_shader_interlock) {
     zpd_fsi_counter_descriptor_buffer_ = zpd_fsi_counter_sink_buffer_;
     zpd_fsi_counter_descriptor_range_ = zpd_fsi_counter_sink_range;
+  }
+
+  // MoltenVK divergent-float-constant workaround: pre-pass compute pipeline
+  // layout - shared memory / EDRAM / gather (set 0) + guest draw constants
+  // (set 1), matching the graphics pipeline layouts for those sets.
+  if (divergent_gather_supported_) {
+    VkDescriptorSetLayout divergent_gather_set_layouts[] = {
+        descriptor_set_layout_shared_memory_and_edram_,
+        descriptor_set_layout_constants_,
+    };
+    VkPipelineLayoutCreateInfo divergent_gather_pipeline_layout_create_info;
+    divergent_gather_pipeline_layout_create_info.sType =
+        VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    divergent_gather_pipeline_layout_create_info.pNext = nullptr;
+    divergent_gather_pipeline_layout_create_info.flags = 0;
+    divergent_gather_pipeline_layout_create_info.setLayoutCount =
+        uint32_t(xe::countof(divergent_gather_set_layouts));
+    divergent_gather_pipeline_layout_create_info.pSetLayouts =
+        divergent_gather_set_layouts;
+    divergent_gather_pipeline_layout_create_info.pushConstantRangeCount = 0;
+    divergent_gather_pipeline_layout_create_info.pPushConstantRanges = nullptr;
+    if (dfn.vkCreatePipelineLayout(
+            device, &divergent_gather_pipeline_layout_create_info, nullptr,
+            &divergent_gather_pipeline_layout_) != VK_SUCCESS) {
+      XELOGE(
+          "Failed to create the divergent-float-constant gather compute "
+          "pipeline layout");
+      return false;
+    }
   }
 
   // Swap objects.
@@ -1262,6 +1348,14 @@ void VulkanCommandProcessor::ShutdownContext() {
                                          resolve_downscale_pipeline_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
                                          resolve_downscale_pipeline_layout_);
+
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                         divergent_gather_pipeline_layout_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
+                                         divergent_gather_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                         divergent_gather_buffer_memory_);
+  divergent_gather_supported_ = false;
 
   ui::vulkan::util::DestroyAndNullHandle(
       dfn.vkDestroyDescriptorPool, device,
@@ -2962,6 +3056,62 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
                        memexport_extent_end - memexport_extent_start));
   } else {
     shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+  }
+
+  // MoltenVK divergent-float-constant workaround: for a skinned vertex shader
+  // (dynamically indexes the float constants via a0), run a compute pre-pass
+  // that resolves the divergent c[a0] reads - which the Metal vertex stage
+  // returns as 0 - into the gather buffer the real vertex shader reads with an
+  // affine index. v1: non-indexed host draws only (gl_VertexIndex == the
+  // sequential vertex ordinal the pre-pass dispatches over).
+  if (divergent_gather_supported_ &&
+      divergent_gather_pipeline_layout_ != VK_NULL_HANDLE &&
+      cvars::divergent_float_constant_gather &&
+      primitive_processing_result.host_vertex_shader_type ==
+          Shader::HostVertexShaderType::kVertex &&
+      primitive_processing_result.index_buffer_type ==
+          PrimitiveProcessor::ProcessedIndexBufferType::kNone &&
+      vertex_shader->constant_register_map().float_dynamic_addressing &&
+      !vertex_shader->memexport_eM_written() &&
+      vertex_shader->GetTextureBindingsAfterTranslation().empty() &&
+      primitive_processing_result.host_draw_vertex_count +
+              (SpirvShaderTranslator::kDivergentGatherComputeGroupSize - 1) <
+          SpirvShaderTranslator::kDivergentGatherMaxVertices) {
+    VkPipeline prepass_pipeline =
+        pipeline_cache_->GetOrCreateDivergentGatherComputePipeline(
+            vertex_shader_translation, divergent_gather_pipeline_layout_);
+    if (prepass_pipeline != VK_NULL_HANDLE) {
+      // Compute can't run inside a render pass.
+      EndRenderPass();
+      // A previous draw's vertex shader may still be reading the gather buffer.
+      PushBufferMemoryBarrier(
+          divergent_gather_buffer_, 0, VK_WHOLE_SIZE,
+          VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
+          VK_ACCESS_SHADER_WRITE_BIT);
+      SubmitBarriers(true);
+      BindExternalComputePipeline(prepass_pipeline);
+      VkDescriptorSet divergent_gather_descriptor_sets[] = {
+          shared_memory_and_edram_descriptor_set_,
+          current_graphics_descriptor_sets_
+              [SpirvShaderTranslator::kDescriptorSetConstants],
+      };
+      deferred_command_buffer_.CmdVkBindDescriptorSets(
+          VK_PIPELINE_BIND_POINT_COMPUTE, divergent_gather_pipeline_layout_, 0,
+          uint32_t(xe::countof(divergent_gather_descriptor_sets)),
+          divergent_gather_descriptor_sets, 0, nullptr);
+      deferred_command_buffer_.CmdVkDispatch(
+          (primitive_processing_result.host_draw_vertex_count +
+           (SpirvShaderTranslator::kDivergentGatherComputeGroupSize - 1)) /
+              SpirvShaderTranslator::kDivergentGatherComputeGroupSize,
+          1, 1);
+      // The real vertex shader reads what the pre-pass just wrote.
+      PushBufferMemoryBarrier(
+          divergent_gather_buffer_, 0, VK_WHOLE_SIZE,
+          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+          VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+          VK_ACCESS_SHADER_READ_BIT);
+    }
   }
 
   // After all commands that may dispatch, copy or insert barriers, submit the
