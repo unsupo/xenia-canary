@@ -213,6 +213,20 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
   return X_STATUS_SUCCESS;
 }
 
+bool GraphicsSystem::InitializeOffscreenPresenter() {
+  if (presenter_) {
+    return true;
+  }
+  if (!provider_) {
+    return false;
+  }
+  presenter_ = provider_->CreatePresenter(
+      [this](bool is_responsible, bool statically_from_ui_thread) {
+        OnHostGpuLossFromAnyThread(is_responsible);
+      });
+  return presenter_ != nullptr;
+}
+
 void GraphicsSystem::Shutdown() {
   if (command_processor_) {
     EndTracing();

@@ -48,6 +48,11 @@ class GraphicsSystem {
   ui::GraphicsProvider* provider() const { return provider_.get(); }
   ui::Presenter* presenter() const { return presenter_.get(); }
 
+  // Creates an offscreen (windowless) presenter if one doesn't exist yet, for
+  // headless guest-output capture (e.g. the GPU trace dumper). Returns whether a
+  // presenter is available afterwards.
+  bool InitializeOffscreenPresenter();
+
   virtual X_STATUS Setup(cpu::Processor* processor,
                          kernel::KernelState* kernel_state,
                          ui::WindowedAppContext* app_context,

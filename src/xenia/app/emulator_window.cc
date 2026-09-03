@@ -1655,6 +1655,7 @@ void EmulatorWindow::CpuBreakIntoDebugger() {
 void EmulatorWindow::CpuBreakIntoHostDebugger() { xe::debugging::Break(); }
 
 void EmulatorWindow::GpuTraceFrame() {
+  XELOGI("GpuTraceFrame: frame trace requested (F4)");
   emulator()->graphics_system()->RequestFrameTrace();
 }
 
