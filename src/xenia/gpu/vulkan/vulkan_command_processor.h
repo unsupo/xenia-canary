@@ -666,6 +666,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
   bool divergent_gather_supported_ = false;
   VkBuffer divergent_gather_buffer_ = VK_NULL_HANDLE;
   VkDeviceMemory divergent_gather_buffer_memory_ = VK_NULL_HANDLE;
+  // XE_DGATHER_DIAG readback (host-visible), 8192 float4.
   // Layout for the pre-pass compute pipelines: set 0 = shared memory / EDRAM /
   // gather buffer, set 1 = guest draw constants. Compatible with the graphics
   // pipeline layouts for those two sets.

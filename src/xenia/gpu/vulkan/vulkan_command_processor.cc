@@ -187,11 +187,11 @@ bool VulkanCommandProcessor::SetupContext() {
   uniform_buffer_pool_ = std::make_unique<ui::vulkan::VulkanUploadBufferPool>(
       vulkan_device,
       VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
-          // MoltenVK divergent-float-constant workaround copies the float
-          // constants from here into the gather buffer before each pre-pass.
+          // The divergent-gather pre-pass copies the float constants from here
+          // into its gather buffer.
           (GetVulkanDevice()->properties().driverID == VK_DRIVER_ID_MOLTENVK
                ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT
-               : 0),
+               : VkBufferUsageFlags(0)),
       xe::align(std::max(ui::GraphicsUploadBufferPool::kDefaultPageSize,
                          size_t(16384)),
                 size_t(device_properties.minUniformBufferOffsetAlignment)));
@@ -353,6 +353,7 @@ bool VulkanCommandProcessor::SetupContext() {
   // fragment-shader-interlock path, this one is the FBO path forced on
   // MoltenVK).
   divergent_gather_supported_ =
+      cvars::divergent_float_constant_gather &&
       !edram_fragment_shader_interlock &&
       GetVulkanDevice()->properties().driverID == VK_DRIVER_ID_MOLTENVK;
   VkDescriptorSetLayoutBinding
@@ -638,7 +639,7 @@ bool VulkanCommandProcessor::SetupContext() {
     divergent_gather_push_constant_range.stageFlags =
         VK_SHADER_STAGE_COMPUTE_BIT;
     divergent_gather_push_constant_range.offset = 0;
-    divergent_gather_push_constant_range.size = sizeof(uint32_t);
+    divergent_gather_push_constant_range.size = 2 * sizeof(uint32_t);
     divergent_gather_pipeline_layout_create_info.pushConstantRangeCount = 1;
     divergent_gather_pipeline_layout_create_info.pPushConstantRanges =
         &divergent_gather_push_constant_range;
@@ -3080,20 +3081,26 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   // returns as 0 - into the gather buffer the real vertex shader reads with an
   // affine index. v1: non-indexed host draws only (gl_VertexIndex == the
   // sequential vertex ordinal the pre-pass dispatches over).
-  // The pre-pass dispatches one invocation per guest vertex *index value*
-  // (0 .. max_vertex_ordinal), independent of the index buffer, so it covers
-  // non-indexed and indexed (kGuestDMA / host-converted) draws alike. Bound the
-  // dispatch generously by the draw's index count - a vertex whose index value
-  // exceeds this (a very large mesh) simply isn't covered.
-  uint32_t divergent_gather_max_ordinal = std::min(
-      SpirvShaderTranslator::kDivergentGatherMaxVertices - 1u,
-      primitive_processing_result.host_draw_vertex_count * 3u);
+  // The pre-pass dispatches one invocation per index-buffer position and keys
+  // the gather buffer by the raw index value (which the real vertex shader also
+  // keys by, as an affine function of the Metal vertex id). v1: non-indexed and
+  // 16-bit kGuestDMA draws (Vulkan binds the guest index buffer directly).
+  bool divergent_gather_index_is_sequential =
+      primitive_processing_result.index_buffer_type ==
+      PrimitiveProcessor::ProcessedIndexBufferType::kNone;
+  bool divergent_gather_index_is_16bit_dma =
+      primitive_processing_result.index_buffer_type ==
+          PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA &&
+      primitive_processing_result.host_index_format ==
+          xenos::IndexFormat::kInt16;
   if (divergent_gather_supported_ &&
       divergent_gather_pipeline_layout_ != VK_NULL_HANDLE &&
       cvars::divergent_float_constant_gather &&
       primitive_processing_result.host_vertex_shader_type ==
           Shader::HostVertexShaderType::kVertex &&
       !shader_32bit_index_dma &&
+      (divergent_gather_index_is_sequential ||
+       divergent_gather_index_is_16bit_dma) &&
       vertex_shader->constant_register_map().float_dynamic_addressing &&
       !vertex_shader->memexport_eM_written() &&
       vertex_shader->GetTextureBindingsAfterTranslation().empty() &&
@@ -3105,8 +3112,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       // Compute can't run inside a render pass.
       EndRenderPass();
       // A previous draw's vertex shader may still be reading the gather buffer;
-      // the pre-pass overwrites it (via the constant-snapshot copy and the
-      // compute dispatch).
+      // the pre-pass overwrites it (constant-snapshot copy + compute dispatch).
       PushBufferMemoryBarrier(
           divergent_gather_buffer_, 0, VK_WHOLE_SIZE,
           VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
@@ -3114,12 +3120,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
           VK_ACCESS_SHADER_READ_BIT,
           VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
       SubmitBarriers(true);
-      // Copy the guest float constants into the front of the gather buffer so
-      // the pre-pass can read bone matrices from `device` storage (a dynamic
-      // index there is compiled correctly by MoltenVK, unlike the `constant`
-      // UBO). current_constant_buffer_infos_ is up to date after UpdateBindings
-      // above; for float_dynamic_addressing shaders the full 256 vec4 are
-      // packed contiguously.
+      // Copy the guest float constants into gather[0 .. ResultsBase) so the
+      // pre-pass reads bone-matrix candidates from `device` storage.
       const VkDescriptorBufferInfo& divergent_gather_float_constants =
           current_constant_buffer_infos_
               [SpirvShaderTranslator::kConstantBufferFloatVertex];
@@ -3149,20 +3151,26 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
           VK_PIPELINE_BIND_POINT_COMPUTE, divergent_gather_pipeline_layout_, 0,
           uint32_t(xe::countof(divergent_gather_descriptor_sets)),
           divergent_gather_descriptor_sets, 0, nullptr);
+      uint32_t divergent_gather_push[2] = {
+          divergent_gather_index_is_sequential
+              ? SpirvShaderTranslator::kDivergentGatherSequentialIndices
+              : primitive_processing_result.guest_index_base,
+          primitive_processing_result.host_draw_vertex_count,
+      };
       deferred_command_buffer_.CmdVkPushConstants(
           divergent_gather_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-          sizeof(divergent_gather_max_ordinal), &divergent_gather_max_ordinal);
+          sizeof(divergent_gather_push), divergent_gather_push);
       deferred_command_buffer_.CmdVkDispatch(
-          (divergent_gather_max_ordinal + 1 +
+          (primitive_processing_result.host_draw_vertex_count +
            (SpirvShaderTranslator::kDivergentGatherComputeGroupSize - 1)) /
               SpirvShaderTranslator::kDivergentGatherComputeGroupSize,
           1, 1);
       // The real vertex shader reads what the pre-pass just wrote.
-      PushBufferMemoryBarrier(
-          divergent_gather_buffer_, 0, VK_WHOLE_SIZE,
-          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-          VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-          VK_ACCESS_SHADER_READ_BIT);
+      PushBufferMemoryBarrier(divergent_gather_buffer_, 0, VK_WHOLE_SIZE,
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                              VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+                              VK_ACCESS_SHADER_WRITE_BIT,
+                              VK_ACCESS_SHADER_READ_BIT);
     }
   }
 

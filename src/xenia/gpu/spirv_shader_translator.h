@@ -374,10 +374,16 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // the gather buffer per vertex (the per-vertex stride, in vec4s); reads past
   // this fall back to the direct (Metal-broken) read.
   static constexpr uint32_t kDivergentGatherMaxReads = 32;
+  // Number of bone-palette entries the pre-pass OpSelect scan covers (a0 == 3*b
+  // for b in 0 .. this-1; c[offset + 3*b] must stay <= 255).
+  static constexpr uint32_t kDivergentGatherBoneScanCount = 80;
   // Upper bound on the vertex ordinal (raw gl_VertexIndex - for a 16-bit index
   // buffer, the little-endian index value) the gather buffer is sized for.
   static constexpr uint32_t kDivergentGatherMaxVertices = 65536;
   static constexpr uint32_t kDivergentGatherComputeGroupSize = 64;
+  // Pre-pass push constant sentinel: the draw is non-indexed, so
+  // gl_GlobalInvocationID.x is the raw vertex index directly.
+  static constexpr uint32_t kDivergentGatherSequentialIndices = 0xFFFFFFFFu;
 
   // The minimum limit for maxPerStageDescriptorStorageBuffers is 4, and for
   // maxStorageBufferRange it's 128 MB. These are the values of those limits on
@@ -751,7 +757,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // gather buffer for this invocation. In the real vertex shader: reads the
   // gather buffer with an affine index. `index` is the already-offset a0
   // relative float constant index.
-  spv::Id LoadDivergentFloatConstant(spv::Id index);
+  spv::Id LoadDivergentFloatConstant(spv::Id index, uint32_t static_offset);
   spv::Id ApplyOperandModifiers(spv::Id operand_value,
                                 const InstructionOperand& original_operand,
                                 bool invert_negate = false,
@@ -1092,7 +1098,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
   uint32_t divergent_gather_slot_;
   // gl_GlobalInvocationID input for the compute pre-pass.
   spv::Id input_global_invocation_id_;
-  // Push constant block for the pre-pass: a single uint, the guest byte address
+  // Push constant block for the pre-pass: the guest byte address
   // of the 16-bit index buffer (or kDivergentGatherSequentialIndices for a
   // non-indexed draw, where gl_GlobalInvocationID.x is the vertex ordinal).
   spv::Id push_constants_divergent_gather_;
