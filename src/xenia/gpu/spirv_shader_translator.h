@@ -1151,8 +1151,24 @@ class SpirvShaderTranslator : public ShaderTranslator {
   std::vector<spv::Id> var_rect_acc_clip_distance_;
   std::vector<spv::Id> var_rect_acc_cull_distance_;
   spv::Id var_rect_acc_point_size_;
+  // Per-guest-vertex (loop iterations 0..2) copies of the outputs, kept so the
+  // synthetic 4th corner can be built by mirroring the vertex opposite the
+  // longest edge (the rectangle's diagonal) across that diagonal, matching the
+  // Direct3D 12 rectangle-list geometry shader. float4[3] / float[3].
+  spv::Id var_rect_v_position_;
+  std::array<spv::Id, xenos::kMaxInterpolators> var_rect_v_interpolators_;
+  std::vector<spv::Id> var_rect_v_clip_distance_;
+  std::vector<spv::Id> var_rect_v_cull_distance_;
+  spv::Id var_rect_v_point_size_;
+  spv::Id type_rect_v_float4_array_3_;
+  spv::Id type_rect_v_float_array_3_;
   spv::Id rect_end_i_;
   spv::Id rect_is_corner_3_;
+  // This host vertex's corner index (0..3) as an int, and (memexport only) a
+  // bool that is true only on the rect loop iteration that owns this corner's
+  // real guest vertex, so memory export runs exactly once per guest vertex.
+  spv::Id rect_corner_int_;
+  spv::Id var_rect_memexport_ok_;
   spv::Block* rect_loop_header_;
   spv::Block* rect_loop_continue_;
   spv::Block* rect_loop_merge_;
