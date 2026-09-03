@@ -364,6 +364,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // memory - the EDRAM FSI bindings are never present at the same time as this
   // one (the workaround only runs on the MoltenVK FBO path).
   static constexpr uint32_t kDivergentGatherSharedMemorySetBinding = 1;
+  // The gather buffer's first kDivergentGatherResultsBaseVec4 vec4s hold a
+  // snapshot of the 256 guest float constants (copied there by the command
+  // processor before each pre-pass dispatch) - the pre-pass reads bone matrices
+  // from this `device` storage copy with a dynamic index, which MoltenVK
+  // compiles correctly, instead of the `constant` UBO (which does not).
+  static constexpr uint32_t kDivergentGatherResultsBaseVec4 = 256;
   // Max number of address-register-relative float constant reads resolved into
   // the gather buffer per vertex (the per-vertex stride, in vec4s); reads past
   // this fall back to the direct (Metal-broken) read.
@@ -372,9 +378,6 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // buffer, the little-endian index value) the gather buffer is sized for.
   static constexpr uint32_t kDivergentGatherMaxVertices = 65536;
   static constexpr uint32_t kDivergentGatherComputeGroupSize = 64;
-  // Pre-pass push constant sentinel: the draw is non-indexed, so
-  // gl_GlobalInvocationID.x is the vertex ordinal directly.
-  static constexpr uint32_t kDivergentGatherSequentialIndices = 0xFFFFFFFFu;
 
   // The minimum limit for maxPerStageDescriptorStorageBuffers is 4, and for
   // maxStorageBufferRange it's 128 MB. These are the values of those limits on

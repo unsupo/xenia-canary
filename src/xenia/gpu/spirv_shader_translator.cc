@@ -1795,14 +1795,11 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
     // Push constant: the guest byte address of the 16-bit index buffer, or
     // kDivergentGatherSequentialIndices for a non-indexed draw.
     {
-      id_vector_temp_.assign(size_t(2), type_uint_);
+      id_vector_temp_.assign(size_t(1), type_uint_);
       spv::Id push_type = builder_->makeStructType(
           id_vector_temp_, "XeDivergentGatherPushConstants");
-      builder_->addMemberName(push_type, 0, "index_buffer_base_bytes");
+      builder_->addMemberName(push_type, 0, "max_vertex_ordinal");
       builder_->addMemberDecoration(push_type, 0, spv::DecorationOffset, 0);
-      builder_->addMemberName(push_type, 1, "vertex_count");
-      builder_->addMemberDecoration(push_type, 1, spv::DecorationOffset,
-                                    sizeof(uint32_t));
       builder_->addDecoration(push_type, spv::DecorationBlock);
       push_constants_divergent_gather_ = builder_->createVariable(
           spv::NoPrecision, spv::StorageClassPushConstant, push_type,
@@ -2008,70 +2005,44 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
   Modification shader_modification = GetSpirvShaderModification();
 
   if (IsDivergentGatherPrepass()) {
-    // Reconstruct the raw gl_VertexIndex the real vertex shader would see for
-    // this pre-pass invocation, so the rest of this function (endian swap / base
-    // add / r0.x write) - and therefore vertex fetch and the a0 it feeds -
-    // matches between the pre-pass and the real vertex shader, and so the gather
-    // slot `raw_vertex_index * kDivergentGatherMaxReads + n` lines up.
-    //   non-indexed: raw gl_VertexIndex == gl_GlobalInvocationID.x
-    //   16-bit kGuestDMA: raw gl_VertexIndex == the little-endian 16-bit value
-    //     at index_buffer_base_bytes + gl_GlobalInvocationID.x * 2 (Vulkan reads
-    //     the guest index buffer as-is; the endian swap happens below).
-    spv::Id gid_raw = builder_->createCompositeExtract(
+    // The pre-pass dispatches one invocation per *guest vertex index value*
+    // (0 .. push.max_vertex_ordinal), not per index-buffer position. For guest
+    // vertex `gid`, set input_vertex_index_ to the *raw* form the real vertex
+    // shader's gl_VertexIndex would hold for that vertex (endian-swap is its own
+    // inverse), so:
+    //  - the rest of this function endian-swaps it back to `gid` and fetches
+    //    guest vertex `gid` - matching the real vertex shader's vertex fetch,
+    //    hence the same a0;
+    //  - LoadDivergentFloatConstant keys the gather slot by input_vertex_index_
+    //    (the raw value) - matching the real vertex shader, which keys by its
+    //    raw gl_VertexIndex.
+    // This needs no index buffer at all (it covers every possible index value),
+    // so it works for non-indexed and any indexed draw alike.
+    spv::Id gid = builder_->createCompositeExtract(
         builder_->createLoad(input_global_invocation_id_, spv::NoPrecision),
         type_uint_, 0);
-    spv::Id index_base = builder_->createLoad(
+    spv::Id max_ordinal = builder_->createLoad(
         builder_->createAccessChain(spv::StorageClassPushConstant,
                                     push_constants_divergent_gather_,
                                     std::vector<spv::Id>(1, const_int_0_)),
         spv::NoPrecision);
-    spv::Id vertex_count = builder_->createLoad(
-        builder_->createAccessChain(
-            spv::StorageClassPushConstant, push_constants_divergent_gather_,
-            std::vector<spv::Id>(1, builder_->makeIntConstant(1))),
+    // Clamp overhang threads to the last ordinal (redundant, harmless rewrites).
+    gid = builder_->createTriOp(
+        spv::OpSelect, type_uint_,
+        builder_->createBinOp(spv::OpULessThan, type_bool_, gid, max_ordinal),
+        gid, max_ordinal);
+    id_vector_temp_.assign(
+        size_t(1), builder_->makeIntConstant(kSystemConstantVertexIndexEndian));
+    spv::Id vertex_index_endian = builder_->createLoad(
+        builder_->createAccessChain(spv::StorageClassUniform,
+                                    uniform_system_constants_, id_vector_temp_),
         spv::NoPrecision);
-    // Clamp threads past the draw's vertex/index count to the last valid one -
-    // they redundantly (but correctly) rewrite that vertex's gather slots
-    // instead of reading out of bounds past the index buffer.
-    spv::Id gid = builder_->createTriOp(
-        spv::OpSelect, type_uint_,
-        builder_->createBinOp(spv::OpULessThan, type_bool_, gid_raw,
-                              vertex_count),
-        gid_raw,
-        builder_->createBinOp(spv::OpISub, type_uint_, vertex_count,
-                              builder_->makeUintConstant(1)));
-    spv::Id is_sequential = builder_->createBinOp(
-        spv::OpIEqual, type_bool_, index_base,
-        builder_->makeUintConstant(kDivergentGatherSequentialIndices));
-    spv::Id byte_offset = builder_->createBinOp(
-        spv::OpIAdd, type_uint_, index_base,
-        builder_->createBinOp(spv::OpShiftLeftLogical, type_uint_, gid,
-                              builder_->makeUintConstant(1)));
-    spv::Id index_dword = LoadUint32FromSharedMemory(builder_->createUnaryOp(
-        spv::OpBitcast, type_int_,
-        builder_->createBinOp(spv::OpShiftRightLogical, type_uint_, byte_offset,
-                              builder_->makeUintConstant(2))));
-    spv::Id index_half = builder_->createBinOp(
-        spv::OpBitwiseAnd, type_uint_,
-        builder_->createBinOp(spv::OpShiftRightLogical, type_uint_, byte_offset,
-                              builder_->makeUintConstant(1)),
-        builder_->makeUintConstant(1));
-    spv::Id index16 = builder_->createTriOp(
-        spv::OpSelect, type_uint_,
-        builder_->createBinOp(spv::OpINotEqual, type_bool_, index_half,
-                              const_uint_0_),
-        builder_->createBinOp(spv::OpShiftRightLogical, type_uint_, index_dword,
-                              builder_->makeUintConstant(16)),
-        builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, index_dword,
-                              builder_->makeUintConstant(0xFFFF)));
     input_vertex_index_ =
         builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction,
                                  type_int_, "xe_vertex_index");
     builder_->createStore(
-        builder_->createUnaryOp(
-            spv::OpBitcast, type_int_,
-            builder_->createTriOp(spv::OpSelect, type_uint_, is_sequential, gid,
-                                  index16)),
+        builder_->createUnaryOp(spv::OpBitcast, type_int_,
+                                EndianSwap32Uint(gid, vertex_index_endian)),
         input_vertex_index_);
   }
 
@@ -3819,6 +3790,19 @@ spv::Id SpirvShaderTranslator::LoadDivergentFloatConstant(spv::Id index) {
   auto direct_read = [&]() -> spv::Id {
     id_vector_temp_util_.clear();
     id_vector_temp_util_.push_back(const_int_0_);
+    if (IsDivergentGatherPrepass()) {
+      // Read the float-constant snapshot the command processor copied into the
+      // front of the gather buffer. A dynamic index into this `device` storage
+      // buffer is compiled correctly by MoltenVK, unlike a dynamic index into
+      // the `constant` float-constant UBO (which returns 0 in both the vertex
+      // and compute stages on Metal).
+      id_vector_temp_util_.push_back(index);
+      return builder_->createLoad(
+          builder_->createAccessChain(spv::StorageClassStorageBuffer,
+                                      buffer_divergent_gather_,
+                                      id_vector_temp_util_),
+          spv::NoPrecision);
+    }
     id_vector_temp_util_.push_back(index);
     return builder_->createLoad(
         builder_->createAccessChain(spv::StorageClassUniform,
@@ -3831,14 +3815,21 @@ spv::Id SpirvShaderTranslator::LoadDivergentFloatConstant(spv::Id index) {
     // direct (Metal-broken, but safe) read rather than corrupting other slots.
     return direct_read();
   }
-  // gather[vertex_ordinal * kDivergentGatherMaxReads + slot]
+  // gather[kDivergentGatherResultsBaseVec4 +
+  //        vertex_ordinal * kDivergentGatherMaxReads + slot]
+  // (the first kDivergentGatherResultsBaseVec4 entries hold the float-constant
+  // snapshot the pre-pass reads from.)
   spv::Id vertex_ordinal =
       builder_->createLoad(input_vertex_index_, spv::NoPrecision);
   spv::Id gather_element = builder_->createBinOp(
       spv::OpIAdd, type_int_,
-      builder_->createBinOp(spv::OpIMul, type_int_, vertex_ordinal,
-                            builder_->makeIntConstant(kDivergentGatherMaxReads)),
-      builder_->makeIntConstant(int(slot)));
+      builder_->makeIntConstant(int(kDivergentGatherResultsBaseVec4)),
+      builder_->createBinOp(
+          spv::OpIAdd, type_int_,
+          builder_->createBinOp(
+              spv::OpIMul, type_int_, vertex_ordinal,
+              builder_->makeIntConstant(kDivergentGatherMaxReads)),
+          builder_->makeIntConstant(int(slot))));
   id_vector_temp_util_.clear();
   id_vector_temp_util_.push_back(const_int_0_);
   id_vector_temp_util_.push_back(gather_element);
@@ -3846,7 +3837,6 @@ spv::Id SpirvShaderTranslator::LoadDivergentFloatConstant(spv::Id index) {
       spv::StorageClassStorageBuffer, buffer_divergent_gather_,
       id_vector_temp_util_);
   if (IsDivergentGatherPrepass()) {
-    // Compute stage - a data-dependent index works here.
     spv::Id value = direct_read();
     builder_->createStore(value, gather_pointer);
     return value;
