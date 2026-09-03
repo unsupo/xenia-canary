@@ -1466,21 +1466,33 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
     // be inspected. Controlled by the XE_DUMP_SWAP env var (path prefix).
     if (const char* dump_prefix = std::getenv("XE_DUMP_SWAP")) {
       static uint32_t xe_swap_n = 0;
+      const RegisterFile& regs = *register_file_;
+      // The presented image is the texture in fetch slot 0 (the game resolves
+      // the final composited frame into it), not necessarily frontbuffer_ptr.
+      auto swap_fetch = regs.GetTextureFetch(0);
+      uint32_t tex_base = swap_fetch.base_address << 12;
       uint32_t w = frontbuffer_width ? frontbuffer_width : 1280;
       uint32_t h = frontbuffer_height ? frontbuffer_height : 720;
-      const uint8_t* src = memory_->TranslatePhysical(frontbuffer_ptr);
-      if (src) {
-        std::string path =
-            fmt::format("{}_{:08X}_{}x{}_{}.raw", dump_prefix, frontbuffer_ptr,
-                        w, h, xe_swap_n++);
+      for (int which = 0; which < 2; ++which) {
+        uint32_t addr = which == 0 ? frontbuffer_ptr : tex_base;
+        const char* tag = which == 0 ? "fb" : "tf0";
+        if (!addr) {
+          continue;
+        }
+        const uint8_t* src = memory_->TranslatePhysical(addr);
+        if (!src) {
+          continue;
+        }
+        std::string path = fmt::format("{}_{}_{:08X}_{}x{}_{}.raw", dump_prefix,
+                                       tag, addr, w, h, xe_swap_n);
         FILE* f = std::fopen(path.c_str(), "wb");
         if (f) {
           std::fwrite(src, 1, size_t(w) * h * 4, f);
           std::fclose(f);
-          XELOGI("XE_DUMP_SWAP wrote {} ({}x{} @ {:08X})", path, w, h,
-                 frontbuffer_ptr);
+          XELOGI("XE_DUMP_SWAP wrote {} ({}x{} @ {:08X})", path, w, h, addr);
         }
       }
+      ++xe_swap_n;
     }
     return;
   }
@@ -3095,6 +3107,7 @@ bool VulkanCommandProcessor::IssueCopy() {
                                      &copy_dest_info, &is_scaled)) {
     return false;
   }
+
 
   // CPU readback resolve path (if not disabled).
   ReadbackResolveMode readback_mode = GetReadbackResolveMode();

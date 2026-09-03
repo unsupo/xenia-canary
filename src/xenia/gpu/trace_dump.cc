@@ -41,6 +41,7 @@ DEFINE_path(target_trace_file, "", "Specifies the trace file to load.",
 DEFINE_path(trace_dump_path, "", "Output path for dumped files.", "GPU.Debug");
 
 DECLARE_bool(async_shader_compilation);
+DECLARE_string(readback_resolve);
 
 namespace xe {
 namespace gpu {
@@ -121,6 +122,9 @@ bool TraceDump::Setup() {
   // creation can't keep up and every draw fails with a null pipeline. Force
   // synchronous shader/pipeline compilation for deterministic replay.
   cvars::async_shader_compilation = false;
+  // Force resolves to actually write EDRAM contents back to guest memory so the
+  // replayed frame is inspectable (many configs default this to "none").
+  cvars::readback_resolve = "full";
   emulator_ = std::make_unique<Emulator>(
       "", storage_root, storage_root / "content", storage_root / "cache");
   X_STATUS result = emulator_->Setup(
