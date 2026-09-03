@@ -2434,6 +2434,14 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
     return false;
   }
   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
+  if (std::getenv("XE_LOG_DRAWS")) {
+    auto* ps = static_cast<VulkanShader*>(active_pixel_shader());
+    bool skinned =
+        vertex_shader->constant_register_map().float_dynamic_addressing;
+    XELOGI("XE_DRAW VS={:016X}{} PS={:016X} prim={} idx={}",
+           vertex_shader->ucode_data_hash(), skinned ? " SKIN" : "",
+           ps ? ps->ucode_data_hash() : 0, uint32_t(prim_type), index_count);
+  }
   // TODO(Triang3l): If the shader uses memory export, but
   // vertexPipelineStoresAndAtomics is not supported, convert the vertex shader
   // to a compute shader and dispatch it after the draw if the draw doesn't use
