@@ -29,6 +29,16 @@ DEFINE_bool(
     "capability.",
     "GPU");
 
+DEFINE_bool(
+    divergent_float_constant_gather, false,
+    "MoltenVK/Metal workaround: the Metal vertex stage returns 0 for a "
+    "per-vertex data-dependent divergent resource index, which collapses GPU "
+    "skinning (invisible Halo 3 characters). When enabled, address-register-"
+    "relative float constant reads in vertex shaders are resolved by a compute "
+    "pre-pass into a gather buffer the vertex shader reads with an affine "
+    "index. No effect on non-MoltenVK drivers.",
+    "GPU");
+
 namespace xe {
 namespace gpu {
 
@@ -45,7 +55,8 @@ SpirvShaderTranslator::Features::Features(bool all)
       denorm_flush_to_zero_float32(all),
       rounding_mode_rte_float32(all),
       fragment_shader_sample_interlock(all),
-      demote_to_helper_invocation(all) {}
+      demote_to_helper_invocation(all),
+      divergent_float_constant_workaround(false) {}
 
 SpirvShaderTranslator::Features::Features(
     const ui::vulkan::VulkanDevice* const vulkan_device)
@@ -69,7 +80,9 @@ SpirvShaderTranslator::Features::Features(
       fragment_shader_sample_interlock(
           vulkan_device->properties().fragmentShaderSampleInterlock),
       demote_to_helper_invocation(
-          vulkan_device->properties().shaderDemoteToHelperInvocation) {
+          vulkan_device->properties().shaderDemoteToHelperInvocation),
+      divergent_float_constant_workaround(
+          vulkan_device->properties().driverID == VK_DRIVER_ID_MOLTENVK) {
   const uint32_t vulkan_api_version = vulkan_device->properties().apiVersion;
   if (vulkan_api_version >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
     spirv_version = spv::Spv_1_5;
@@ -123,6 +136,10 @@ void SpirvShaderTranslator::Reset() {
   builder_.reset();
 
   uniform_float_constants_ = spv::NoResult;
+
+  buffer_divergent_gather_ = spv::NoResult;
+  divergent_gather_slot_ = 0;
+  input_global_invocation_id_ = spv::NoResult;
 
   // Vertex shader inputs.
   input_vertex_index_ = spv::NoResult;
@@ -1258,6 +1275,11 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
       // the guest backface culling removes the whole surface.
       builder_->addExecutionMode(function_main_,
                                  spv::ExecutionModeVertexOrderCw);
+    } else if (IsDivergentGatherPrepass()) {
+      // MoltenVK workaround: the divergent-gather pre-pass is a compute shader.
+      execution_model = spv::ExecutionModelGLCompute;
+      builder_->addExecutionMode(function_main_, spv::ExecutionModeLocalSize,
+                                 int(kDivergentGatherComputeGroupSize), 1, 1);
     } else {
       execution_model = spv::ExecutionModelVertex;
     }
@@ -1724,7 +1746,53 @@ void SpirvShaderTranslator::EnsureBuildPointAvailable() {
   builder_->setBuildPoint(&new_block);
 }
 
+void SpirvShaderTranslator::DeclareDivergentGatherBuffer() {
+  // MoltenVK divergent-float-constant workaround gather buffer: a storage buffer
+  // holding a runtime array of vec4, kDivergentGatherMaxReads slots per vertex.
+  spv::Id gather_array = builder_->makeRuntimeArray(type_float4_);
+  builder_->addDecoration(gather_array, spv::DecorationArrayStride,
+                          sizeof(float) * 4);
+  id_vector_temp_.assign(size_t(1), gather_array);
+  spv::Id gather_type =
+      builder_->makeStructType(id_vector_temp_, "XeDivergentGather");
+  builder_->addMemberName(gather_type, 0, "gather");
+  builder_->addMemberDecoration(gather_type, 0, spv::DecorationOffset, 0);
+  builder_->addMemberDecoration(gather_type, 0, spv::DecorationRestrict);
+  if (!IsDivergentGatherPrepass()) {
+    builder_->addMemberDecoration(gather_type, 0, spv::DecorationNonWritable);
+  }
+  builder_->addDecoration(gather_type, spv::DecorationBlock);
+  buffer_divergent_gather_ = builder_->createVariable(
+      spv::NoPrecision, spv::StorageClassStorageBuffer, gather_type,
+      "xe_divergent_gather");
+  builder_->addDecoration(buffer_divergent_gather_,
+                          spv::DecorationDescriptorSet,
+                          int(kDescriptorSetConstants));
+  builder_->addDecoration(buffer_divergent_gather_, spv::DecorationBinding,
+                          int(kConstantBufferDivergentGather));
+  if (features_.spirv_version >= spv::Spv_1_4) {
+    main_interface_.push_back(buffer_divergent_gather_);
+  }
+}
+
 void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
+  if (DivergentGatherActive()) {
+    DeclareDivergentGatherBuffer();
+  }
+  if (IsDivergentGatherPrepass()) {
+    // The compute pre-pass has no rasterization outputs - only
+    // gl_GlobalInvocationID (used as the vertex ordinal, wired into
+    // input_vertex_index_ in StartVertexOrTessEvalShaderInMain) and the gather
+    // buffer it fills.
+    input_global_invocation_id_ = builder_->createVariable(
+        spv::NoPrecision, spv::StorageClassInput, type_uint3_,
+        "gl_GlobalInvocationID");
+    builder_->addDecoration(
+        input_global_invocation_id_, spv::DecorationBuiltIn,
+        static_cast<int>(spv::BuiltIn::GlobalInvocationId));
+    main_interface_.push_back(input_global_invocation_id_);
+    return;
+  }
   // Create the inputs.
   if (IsSpirvTessEvalShader()) {
     // Per-control-point index input from the hull shader, mirroring the control
@@ -1918,6 +1986,26 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
 
 void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
   Modification shader_modification = GetSpirvShaderModification();
+
+  if (IsDivergentGatherPrepass()) {
+    // gl_VertexIndex stand-in for the compute pre-pass: gl_GlobalInvocationID.x.
+    // Everything downstream (vertex fetch, the gather stores) then works exactly
+    // like the real vertex shader, so the gather slot for a given ordinal
+    // matches between the two.
+    input_vertex_index_ =
+        builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction,
+                                 type_int_, "xe_vertex_index");
+    builder_->createStore(
+        builder_->createUnaryOp(
+            spv::OpBitcast, type_int_,
+            builder_->createCompositeExtract(
+                builder_->createLoad(input_global_invocation_id_,
+                                     spv::NoPrecision),
+                type_uint_, 0)),
+        input_vertex_index_);
+    return;
+  }
+
   bool is_rect_vs =
       (shader_modification.vertex.host_vertex_shader_type ==
        Shader::HostVertexShaderType::kRectangleListAsTriangleStrip);
@@ -2503,6 +2591,12 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
 }
 
 void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
+  if (IsDivergentGatherPrepass()) {
+    // The compute pre-pass only fills the gather buffer - no clip position,
+    // interpolators or clip/cull distances to finalize.
+    return;
+  }
+
   Modification shader_modification = GetSpirvShaderModification();
 
   id_vector_temp_.clear();
@@ -3602,6 +3696,12 @@ spv::Id SpirvShaderTranslator::LoadOperandStorage(
       operand.storage_addressing_mode, operand.storage_index,
       operand.storage_source == InstructionStorageSource::kConstantFloat);
   EnsureBuildPointAvailable();
+  if (buffer_divergent_gather_ != spv::NoResult &&
+      operand.storage_source == InstructionStorageSource::kConstantFloat &&
+      operand.storage_addressing_mode ==
+          InstructionStorageAddressingMode::kAddressRegisterRelative) {
+    return LoadDivergentFloatConstant(index);
+  }
   spv::Id vec4_pointer = spv::NoResult;
   switch (operand.storage_source) {
     case InstructionStorageSource::kRegister:
@@ -3628,6 +3728,61 @@ spv::Id SpirvShaderTranslator::LoadOperandStorage(
   }
   assert_true(vec4_pointer != spv::NoResult);
   return builder_->createLoad(vec4_pointer, spv::NoPrecision);
+}
+
+bool SpirvShaderTranslator::DivergentGatherActive() const {
+  return cvars::divergent_float_constant_gather &&
+         features_.divergent_float_constant_workaround && is_vertex_shader() &&
+         GetSpirvShaderModification().vertex.host_vertex_shader_type ==
+             Shader::HostVertexShaderType::kVertex &&
+         current_shader().constant_register_map().float_dynamic_addressing &&
+         !current_shader().memexport_eM_written();
+}
+
+spv::Id SpirvShaderTranslator::LoadDivergentFloatConstant(spv::Id index) {
+  // MoltenVK/Metal returns float4(0) for a per-vertex data-dependent divergent
+  // resource index in the vertex stage, which collapses GPU skinning. `index`
+  // (a0 + storage_index) is exactly that. The compute pre-pass resolves each
+  // such read into the gather buffer; the real vertex shader reads it back with
+  // an affine index (vertex ordinal * stride + slot), which Metal handles.
+  EnsureBuildPointAvailable();
+  uint32_t slot = divergent_gather_slot_++;
+  auto direct_read = [&]() -> spv::Id {
+    id_vector_temp_util_.clear();
+    id_vector_temp_util_.push_back(const_int_0_);
+    id_vector_temp_util_.push_back(index);
+    return builder_->createLoad(
+        builder_->createAccessChain(spv::StorageClassUniform,
+                                    uniform_float_constants_,
+                                    id_vector_temp_util_),
+        spv::NoPrecision);
+  };
+  if (slot >= kDivergentGatherMaxReads) {
+    // More divergent reads than the gather buffer holds - fall back to the
+    // direct (Metal-broken, but safe) read rather than corrupting other slots.
+    return direct_read();
+  }
+  // gather[vertex_ordinal * kDivergentGatherMaxReads + slot]
+  spv::Id vertex_ordinal =
+      builder_->createLoad(input_vertex_index_, spv::NoPrecision);
+  spv::Id gather_element = builder_->createBinOp(
+      spv::OpIAdd, type_int_,
+      builder_->createBinOp(spv::OpIMul, type_int_, vertex_ordinal,
+                            builder_->makeIntConstant(kDivergentGatherMaxReads)),
+      builder_->makeIntConstant(int(slot)));
+  id_vector_temp_util_.clear();
+  id_vector_temp_util_.push_back(const_int_0_);
+  id_vector_temp_util_.push_back(gather_element);
+  spv::Id gather_pointer = builder_->createAccessChain(
+      spv::StorageClassStorageBuffer, buffer_divergent_gather_,
+      id_vector_temp_util_);
+  if (IsDivergentGatherPrepass()) {
+    // Compute stage - a data-dependent index works here.
+    spv::Id value = direct_read();
+    builder_->createStore(value, gather_pointer);
+    return value;
+  }
+  return builder_->createLoad(gather_pointer, spv::NoPrecision);
 }
 
 spv::Id SpirvShaderTranslator::ApplyOperandModifiers(
@@ -3715,6 +3870,22 @@ void SpirvShaderTranslator::StoreResult(const InstructionResult& result,
   uint32_t used_write_mask = result.GetUsedWriteMask();
   if (!used_write_mask) {
     return;
+  }
+
+  if (IsDivergentGatherPrepass()) {
+    // The compute pre-pass has no rasterization / memory-export outputs - it
+    // only fills the gather buffer via LoadDivergentFloatConstant. Register
+    // writes still matter (they feed the a0 computation).
+    switch (result.storage_target) {
+      case InstructionStorageTarget::kPosition:
+      case InstructionStorageTarget::kInterpolator:
+      case InstructionStorageTarget::kPointSizeEdgeFlagKillVertex:
+      case InstructionStorageTarget::kExportAddress:
+      case InstructionStorageTarget::kExportData:
+        return;
+      default:
+        break;
+    }
   }
 
   EnsureBuildPointAvailable();

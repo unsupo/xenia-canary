@@ -34,7 +34,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
     // prototyping stage (easier to do small granular updates with an
     // incremental counter).
-    static constexpr uint32_t kVersion = 18;
+    static constexpr uint32_t kVersion = 19;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -91,6 +91,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
       // in SPIR-V the spacing lives in the domain shader). Discrete uses equal
       // spacing, continuous and adaptive use fractional even.
       xenos::TessellationMode tessellation_mode : 2;
+      // MoltenVK/Metal workaround: this `kVertex` shader is translated as a
+      // compute pre-pass that resolves the per-vertex data-dependent divergent
+      // float-constant reads (which the Metal vertex stage returns as 0) into a
+      // gather buffer the real vertex shader then reads with an affine index.
+      uint32_t divergent_gather_prepass : 1;
     } vertex;
     struct PixelShaderModification {
       // uint32_t 0.
@@ -345,9 +350,22 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kConstantBufferFetch,
     kConstantBufferClipPlanes,
     kConstantBufferTessellation,
+    // MoltenVK divergent-float-constant workaround: a storage buffer with a
+    // runtime array of vec4, kDivergentGatherMaxReads slots per vertex. Filled
+    // by the compute pre-pass (Modification.vertex.divergent_gather_prepass),
+    // read with an affine index by the real vertex shader. Only referenced by
+    // `kVertex` shaders that dynamically index the float constants, when the
+    // workaround feature is active.
+    kConstantBufferDivergentGather,
 
     kConstantBufferCount,
   };
+
+  // Max number of address-register-relative float constant reads a shader may
+  // have to be eligible for the MoltenVK divergent gather workaround, and the
+  // per-vertex stride (in vec4s) of the gather buffer.
+  static constexpr uint32_t kDivergentGatherMaxReads = 32;
+  static constexpr uint32_t kDivergentGatherComputeGroupSize = 64;
 
   // The minimum limit for maxPerStageDescriptorStorageBuffers is 4, and for
   // maxStorageBufferRange it's 128 MB. These are the values of those limits on
@@ -429,6 +447,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
     bool fragment_shader_sample_interlock;
 
     bool demote_to_helper_invocation;
+
+    // MoltenVK/Metal returns float4(0) for a per-vertex data-dependent divergent
+    // resource index in the vertex stage. When set, address-register-relative
+    // (a0) float constant reads in `kVertex` shaders go through a gather buffer
+    // filled by a compute pre-pass instead (see divergent_gather_prepass).
+    bool divergent_float_constant_workaround;
   };
 
   SpirvShaderTranslator(const Features& features,
@@ -588,9 +612,22 @@ class SpirvShaderTranslator : public ShaderTranslator {
   }
   bool IsSpirvComputeShader() const {
     return is_vertex_shader() &&
-           GetSpirvShaderModification().vertex.host_vertex_shader_type ==
-               Shader::HostVertexShaderType::kMemExportCompute;
+           (GetSpirvShaderModification().vertex.host_vertex_shader_type ==
+                Shader::HostVertexShaderType::kMemExportCompute ||
+            IsDivergentGatherPrepass());
   }
+  // MoltenVK workaround: this translation is the compute pre-pass that fills the
+  // divergent-float-constant gather buffer (see Features).
+  bool IsDivergentGatherPrepass() const {
+    return is_vertex_shader() &&
+           GetSpirvShaderModification().vertex.host_vertex_shader_type ==
+               Shader::HostVertexShaderType::kVertex &&
+           GetSpirvShaderModification().vertex.divergent_gather_prepass != 0;
+  }
+  // Whether address-register-relative float constant reads in this translation
+  // should go through the MoltenVK divergent gather buffer (true both for the
+  // compute pre-pass that fills it and the real vertex shader that reads it).
+  bool DivergentGatherActive() const;
 
   bool IsExecutionModeEarlyFragmentTests() const {
     return is_pixel_shader() &&
@@ -657,6 +694,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   void StartVertexOrTessEvalShaderBeforeMain();
   void StartVertexOrTessEvalShaderInMain();
   void CompleteVertexOrTessEvalShaderInMain();
+  // MoltenVK divergent-float-constant workaround: declares buffer_divergent_gather_.
+  void DeclareDivergentGatherBuffer();
 
   void StartFragmentShaderBeforeMain();
   void StartFragmentShaderInMain();
@@ -689,6 +728,13 @@ class SpirvShaderTranslator : public ShaderTranslator {
       bool is_float_constant = false);
   // Loads unswizzled operand without sign modifiers as float4.
   spv::Id LoadOperandStorage(const InstructionOperand& operand);
+  // MoltenVK workaround for a per-vertex data-dependent divergent
+  // xe_uniform_float_constants[index] read. In the compute pre-pass: reads the
+  // buffer directly (works in the compute stage) and stores the result into the
+  // gather buffer for this invocation. In the real vertex shader: reads the
+  // gather buffer with an affine index. `index` is the already-offset a0
+  // relative float constant index.
+  spv::Id LoadDivergentFloatConstant(spv::Id index);
   spv::Id ApplyOperandModifiers(spv::Id operand_value,
                                 const InstructionOperand& original_operand,
                                 bool invert_negate = false,
@@ -1019,6 +1065,16 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id uniform_clip_plane_constants_;
   spv::Id uniform_float_constants_;
   spv::Id uniform_bool_loop_constants_;
+
+  // MoltenVK divergent-float-constant workaround. buffer_divergent_gather_ is a
+  // storage buffer with a runtime array of vec4, kDivergentGatherMaxReads slots
+  // per invocation. divergent_gather_slot_ is the running index of the next
+  // a0-relative float constant read within the shader. spv::NoResult /
+  // unused unless the workaround applies to this translation.
+  spv::Id buffer_divergent_gather_;
+  uint32_t divergent_gather_slot_;
+  // gl_GlobalInvocationID input for the compute pre-pass.
+  spv::Id input_global_invocation_id_;
   spv::Id uniform_fetch_constants_;
 
   spv::Id buffers_shared_memory_;
