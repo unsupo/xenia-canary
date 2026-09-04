@@ -385,7 +385,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // vertex index (& 0xFFFF): [0]={a0, value.x, value.w, raw}, [1]=r0 (raw
   // weights), [2]=r1 (normalized weights), [3]=r6 (bone idx * stride) for the
   // pre-pass / r5 (a blend accumulator) for the vertex shader.
-  static constexpr uint32_t kDivergentGatherDiagStrideVec4 = 4;
+  static constexpr uint32_t kDivergentGatherDiagStrideVec4 = 20;
   static constexpr uint32_t kDivergentGatherDiagPreBaseVec4 =
       kDivergentGatherResultsBaseVec4 +
       kDivergentGatherMaxVertices * kDivergentGatherMaxReads;

@@ -1631,10 +1631,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
           if (f) {
             std::fwrite(mapped, 1, dg_size, f);
             std::fclose(f);
-            XELOGI("XE_DGATHER_DIAG wrote {} ({} bytes; first half=pre-pass, "
-                   "second half=vertex shader; 4 float4 per raw idx&0xFFFF: "
-                   "[0]={{a0,val.x,val.w,raw}} [1]=r0 [2]=r1 [3]=r6)",
-                   path, dg_size);
+            XELOGI("XE_DGATHER_DIAG wrote {} ({} bytes; stride {} float4 per raw "
+                   "idx&0xFFFF; first half=pre-pass probe [0]={{a0,val.x,val.w,"
+                   "raw}} [1]=r0 [2]=r1 [3]=r6; second half=vertex-shader end "
+                   "[4]=oPos [5+r]=rN for r in 0..11 (r11=slot 16))",
+                   path, dg_size,
+                   SpirvShaderTranslator::kDivergentGatherDiagStrideVec4);
           }
           dg_dfn.vkUnmapMemory(dg_dev->device(), divergent_gather_buffer_memory_);
         }

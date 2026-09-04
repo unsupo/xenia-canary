@@ -2678,17 +2678,15 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
       spv::StorageClassOutput, output_per_vertex_, id_vector_temp_);
   spv::Id guest_position = builder_->createLoad(position_ptr, spv::NoPrecision);
 
-  // XE_DGATHER_DIAG: record the pre-projection guest oPos, keyed by raw vertex
-  // index, into diag slot [3] of the vertex-shader region (overwriting the r5
-  // capture from LoadDivergentFloatConstant - oPos is more useful).
+  // XE_DGATHER_DIAG: at the end of the real vertex shader, keyed by raw vertex
+  // index, record [4]=guest oPos, then [5+r] = register rN for r in 0..11.
+  // r11 = skinned normal lands at slot 16; stride is 20 vec4.
   if (buffer_divergent_gather_ != spv::NoResult && DivergentGatherDiagEnabled() &&
-      input_vertex_index_ != spv::NoResult) {
+      input_vertex_index_ != spv::NoResult && var_main_registers_ != spv::NoResult) {
     spv::Id raw = builder_->createLoad(input_vertex_index_, spv::NoPrecision);
-    id_vector_temp_.clear();
-    id_vector_temp_.push_back(const_int_0_);
-    id_vector_temp_.push_back(builder_->createBinOp(
+    spv::Id vbase = builder_->createBinOp(
         spv::OpIAdd, type_int_,
-        builder_->makeIntConstant(int(kDivergentGatherDiagVsBaseVec4) + 3),
+        builder_->makeIntConstant(int(kDivergentGatherDiagVsBaseVec4)),
         builder_->createUnaryOp(
             spv::OpBitcast, type_int_,
             builder_->createBinOp(
@@ -2697,11 +2695,26 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
                     spv::OpBitwiseAnd, type_uint_,
                     builder_->createUnaryOp(spv::OpBitcast, type_uint_, raw),
                     builder_->makeUintConstant(0xFFFF)),
-                builder_->makeUintConstant(kDivergentGatherDiagStrideVec4)))));
-    builder_->createStore(guest_position,
-                          builder_->createAccessChain(
-                              spv::StorageClassStorageBuffer,
-                              buffer_divergent_gather_, id_vector_temp_));
+                builder_->makeUintConstant(kDivergentGatherDiagStrideVec4))));
+    auto dput = [&](int off, spv::Id v) {
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(const_int_0_);
+      id_vector_temp_.push_back(builder_->createBinOp(
+          spv::OpIAdd, type_int_, vbase, builder_->makeIntConstant(off)));
+      builder_->createStore(v, builder_->createAccessChain(
+                                   spv::StorageClassStorageBuffer,
+                                   buffer_divergent_gather_, id_vector_temp_));
+    };
+    dput(4, guest_position);
+    for (int r = 0; r < 12; ++r) {
+      id_vector_temp_util_.clear();
+      id_vector_temp_util_.push_back(builder_->makeIntConstant(r));
+      dput(5 + r, builder_->createLoad(
+                      builder_->createAccessChain(spv::StorageClassFunction,
+                                                  var_main_registers_,
+                                                  id_vector_temp_util_),
+                      spv::NoPrecision));
+    }
   }
 
   // Check if the shader already returns W, not 1/W, and if it doesn't, turn 1/W
