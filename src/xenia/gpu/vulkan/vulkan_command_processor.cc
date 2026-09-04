@@ -579,17 +579,24 @@ bool VulkanCommandProcessor::SetupContext() {
   // EDRAM FSI bindings above).
   VkDescriptorBufferInfo divergent_gather_descriptor_buffer_info;
   if (divergent_gather_supported_) {
-    constexpr VkDeviceSize kDivergentGatherBufferSize =
-        VkDeviceSize(SpirvShaderTranslator::kDivergentGatherResultsBaseVec4 +
-                     VkDeviceSize(
-                         SpirvShaderTranslator::kDivergentGatherMaxVertices) *
-                         SpirvShaderTranslator::kDivergentGatherMaxReads) *
+    const bool divergent_gather_diag = std::getenv("XE_DGATHER_DIAG") != nullptr;
+    VkDeviceSize kDivergentGatherBufferSize =
+        VkDeviceSize(
+            divergent_gather_diag
+                ? SpirvShaderTranslator::kDivergentGatherDiagVsBaseVec4 +
+                      SpirvShaderTranslator::kDivergentGatherMaxVertices
+                : SpirvShaderTranslator::kDivergentGatherResultsBaseVec4 +
+                      VkDeviceSize(
+                          SpirvShaderTranslator::kDivergentGatherMaxVertices) *
+                          SpirvShaderTranslator::kDivergentGatherMaxReads) *
         sizeof(float) * 4;
     if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
             GetVulkanDevice(), kDivergentGatherBufferSize,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                 VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            ui::vulkan::util::MemoryPurpose::kDeviceLocal,
+            divergent_gather_diag
+                ? ui::vulkan::util::MemoryPurpose::kReadback
+                : ui::vulkan::util::MemoryPurpose::kDeviceLocal,
             divergent_gather_buffer_, divergent_gather_buffer_memory_)) {
       XELOGE("Failed to create the divergent-float-constant gather buffer");
       return false;
@@ -1604,6 +1611,33 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
         }
       }
       ++xe_swap_n;
+    }
+    if (const char* dg_diag = std::getenv("XE_DGATHER_DIAG")) {
+      if (divergent_gather_buffer_memory_ != VK_NULL_HANDLE) {
+        const ui::vulkan::VulkanDevice* const dg_dev = GetVulkanDevice();
+        const ui::vulkan::VulkanDevice::Functions& dg_dfn = dg_dev->functions();
+        VkDeviceSize dg_off =
+            VkDeviceSize(SpirvShaderTranslator::kDivergentGatherDiagPreBaseVec4) *
+            16u;
+        VkDeviceSize dg_size =
+            VkDeviceSize(SpirvShaderTranslator::kDivergentGatherMaxVertices) *
+            2u * 16u;
+        void* mapped = nullptr;
+        if (dg_dfn.vkMapMemory(dg_dev->device(), divergent_gather_buffer_memory_,
+                               dg_off, dg_size, 0, &mapped) == VK_SUCCESS) {
+          std::string path = fmt::format("{}_dgdiag.raw", dg_diag);
+          FILE* f = std::fopen(path.c_str(), "wb");
+          if (f) {
+            std::fwrite(mapped, 1, dg_size, f);
+            std::fclose(f);
+            XELOGI("XE_DGATHER_DIAG wrote {} ({} bytes; [0..1MiB)=pre-pass, "
+                   "[1MiB..2MiB)=vertex shader, float4 per raw index & 0xFFFF: "
+                   "x=a0 y=static_offset z=raw_index)",
+                   path, dg_size);
+          }
+          dg_dfn.vkUnmapMemory(dg_dev->device(), divergent_gather_buffer_memory_);
+        }
+      }
     }
     return;
   }
