@@ -381,15 +381,17 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // buffer, the little-endian index value) the gather buffer is sized for.
   static constexpr uint32_t kDivergentGatherMaxVertices = 65536;
   static constexpr uint32_t kDivergentGatherComputeGroupSize = 64;
-  // XE_DGATHER_DIAG only: two 65536-vec4 probe regions after the results, keyed
-  // by (raw vertex index & 0xFFFF). Slot .x = a0, .y = static_offset,
-  // .z = raw index, .w = 0. Compare the pre-pass region against the vertex-
-  // shader region to see where a0 diverges.
+  // XE_DGATHER_DIAG only: two probe regions after the results, 4 vec4 per raw
+  // vertex index (& 0xFFFF): [0]={a0, value.x, value.w, raw}, [1]=r0 (raw
+  // weights), [2]=r1 (normalized weights), [3]=r6 (bone idx * stride) for the
+  // pre-pass / r5 (a blend accumulator) for the vertex shader.
+  static constexpr uint32_t kDivergentGatherDiagStrideVec4 = 4;
   static constexpr uint32_t kDivergentGatherDiagPreBaseVec4 =
       kDivergentGatherResultsBaseVec4 +
       kDivergentGatherMaxVertices * kDivergentGatherMaxReads;
   static constexpr uint32_t kDivergentGatherDiagVsBaseVec4 =
-      kDivergentGatherDiagPreBaseVec4 + kDivergentGatherMaxVertices;
+      kDivergentGatherDiagPreBaseVec4 +
+      kDivergentGatherMaxVertices * kDivergentGatherDiagStrideVec4;
   // Pre-pass push constant sentinel: the draw is non-indexed, so
   // gl_GlobalInvocationID.x is the raw vertex index directly.
   static constexpr uint32_t kDivergentGatherSequentialIndices = 0xFFFFFFFFu;
@@ -655,6 +657,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // should go through the MoltenVK divergent gather buffer (true both for the
   // compute pre-pass that fills it and the real vertex shader that reads it).
   bool DivergentGatherActive() const;
+  // XE_DGATHER_DIAG (optionally filtered to XE_DGATHER_HASH) is set for this
+  // translation.
+  bool DivergentGatherDiagEnabled() const;
 
   bool IsExecutionModeEarlyFragmentTests() const {
     return is_pixel_shader() &&

@@ -1759,7 +1759,7 @@ void SpirvShaderTranslator::DeclareDivergentGatherBuffer() {
   builder_->addMemberName(gather_type, 0, "gather");
   builder_->addMemberDecoration(gather_type, 0, spv::DecorationOffset, 0);
   builder_->addMemberDecoration(gather_type, 0, spv::DecorationRestrict);
-  if (!IsDivergentGatherPrepass() && !std::getenv("XE_DGATHER_DIAG")) {
+  if (!IsDivergentGatherPrepass() && !DivergentGatherDiagEnabled()) {
     builder_->addMemberDecoration(gather_type, 0, spv::DecorationNonWritable);
   }
   builder_->addDecoration(gather_type, spv::DecorationBlock);
@@ -2677,6 +2677,32 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
   spv::Id position_ptr = builder_->createAccessChain(
       spv::StorageClassOutput, output_per_vertex_, id_vector_temp_);
   spv::Id guest_position = builder_->createLoad(position_ptr, spv::NoPrecision);
+
+  // XE_DGATHER_DIAG: record the pre-projection guest oPos, keyed by raw vertex
+  // index, into diag slot [3] of the vertex-shader region (overwriting the r5
+  // capture from LoadDivergentFloatConstant - oPos is more useful).
+  if (buffer_divergent_gather_ != spv::NoResult && DivergentGatherDiagEnabled() &&
+      input_vertex_index_ != spv::NoResult) {
+    spv::Id raw = builder_->createLoad(input_vertex_index_, spv::NoPrecision);
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(const_int_0_);
+    id_vector_temp_.push_back(builder_->createBinOp(
+        spv::OpIAdd, type_int_,
+        builder_->makeIntConstant(int(kDivergentGatherDiagVsBaseVec4) + 3),
+        builder_->createUnaryOp(
+            spv::OpBitcast, type_int_,
+            builder_->createBinOp(
+                spv::OpIMul, type_uint_,
+                builder_->createBinOp(
+                    spv::OpBitwiseAnd, type_uint_,
+                    builder_->createUnaryOp(spv::OpBitcast, type_uint_, raw),
+                    builder_->makeUintConstant(0xFFFF)),
+                builder_->makeUintConstant(kDivergentGatherDiagStrideVec4)))));
+    builder_->createStore(guest_position,
+                          builder_->createAccessChain(
+                              spv::StorageClassStorageBuffer,
+                              buffer_divergent_gather_, id_vector_temp_));
+  }
 
   // Check if the shader already returns W, not 1/W, and if it doesn't, turn 1/W
   // into W.
@@ -3802,6 +3828,23 @@ spv::Id SpirvShaderTranslator::LoadOperandStorage(
   return builder_->createLoad(vec4_pointer, spv::NoPrecision);
 }
 
+bool SpirvShaderTranslator::DivergentGatherDiagEnabled() const {
+  if (!std::getenv("XE_DGATHER_DIAG")) {
+    return false;
+  }
+  const char* h = std::getenv("XE_DGATHER_HASH");
+  if (h && *h) {
+    char buf[24];
+    std::snprintf(buf, sizeof(buf), "%016llX",
+                  static_cast<unsigned long long>(
+                      current_shader().ucode_data_hash()));
+    if (std::strcmp(buf, h) != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool SpirvShaderTranslator::DivergentGatherActive() const {
   return cvars::divergent_float_constant_gather &&
          features_.divergent_float_constant_workaround && is_vertex_shader() &&
@@ -3850,31 +3893,56 @@ spv::Id SpirvShaderTranslator::LoadDivergentFloatConstant(
   auto dgdiag_probe = [&](spv::Id a0_val, spv::Id read_value,
                           uint32_t region_base) {
     const char* ds = std::getenv("XE_DGATHER_SLOT");
-    if (slot != uint32_t(ds ? atoi(ds) : 0) || !std::getenv("XE_DGATHER_DIAG")) {
+    if (slot != uint32_t(ds ? atoi(ds) : 0) || !DivergentGatherDiagEnabled()) {
       return;
     }
     spv::Id raw = builder_->createLoad(input_vertex_index_, spv::NoPrecision);
-    spv::Id elem = builder_->createBinOp(
+    spv::Id base = builder_->createBinOp(
         spv::OpIAdd, type_int_, builder_->makeIntConstant(int(region_base)),
         builder_->createUnaryOp(
             spv::OpBitcast, type_int_,
             builder_->createBinOp(
-                spv::OpBitwiseAnd, type_uint_,
-                builder_->createUnaryOp(spv::OpBitcast, type_uint_, raw),
-                builder_->makeUintConstant(0xFFFF))));
-    id_vector_temp_util_.clear();
-    id_vector_temp_util_.push_back(const_int_0_);
-    id_vector_temp_util_.push_back(elem);
-    std::vector<spv::Id> pv{
-        builder_->createUnaryOp(spv::OpConvertSToF, type_float_, a0_val),
-        builder_->createCompositeExtract(read_value, type_float_, 0),
-        builder_->createCompositeExtract(read_value, type_float_, 3),
-        builder_->createUnaryOp(spv::OpConvertSToF, type_float_, raw)};
-    builder_->createStore(
-        builder_->createCompositeConstruct(type_float4_, pv),
-        builder_->createAccessChain(spv::StorageClassStorageBuffer,
-                                    buffer_divergent_gather_,
-                                    id_vector_temp_util_));
+                spv::OpIMul, type_uint_,
+                builder_->createBinOp(
+                    spv::OpBitwiseAnd, type_uint_,
+                    builder_->createUnaryOp(spv::OpBitcast, type_uint_, raw),
+                    builder_->makeUintConstant(0xFFFF)),
+                builder_->makeUintConstant(kDivergentGatherDiagStrideVec4))));
+    auto reg = [&](int n) {
+      id_vector_temp_util_.clear();
+      id_vector_temp_util_.push_back(builder_->makeIntConstant(n));
+      return builder_->createLoad(
+          builder_->createAccessChain(spv::StorageClassFunction,
+                                      var_main_registers_, id_vector_temp_util_),
+          spv::NoPrecision);
+    };
+    auto put = [&](int off, std::vector<spv::Id> comps) {
+      id_vector_temp_util_.clear();
+      id_vector_temp_util_.push_back(const_int_0_);
+      id_vector_temp_util_.push_back(builder_->createBinOp(
+          spv::OpIAdd, type_int_, base, builder_->makeIntConstant(off)));
+      builder_->createStore(
+          builder_->createCompositeConstruct(type_float4_, comps),
+          builder_->createAccessChain(spv::StorageClassStorageBuffer,
+                                      buffer_divergent_gather_,
+                                      id_vector_temp_util_));
+    };
+    put(0, {builder_->createUnaryOp(spv::OpConvertSToF, type_float_, a0_val),
+            builder_->createCompositeExtract(read_value, type_float_, 0),
+            builder_->createCompositeExtract(read_value, type_float_, 3),
+            builder_->createUnaryOp(spv::OpConvertSToF, type_float_, raw)});
+    put(1, {builder_->createCompositeExtract(reg(0), type_float_, 0),
+            builder_->createCompositeExtract(reg(0), type_float_, 1),
+            builder_->createCompositeExtract(reg(0), type_float_, 2),
+            builder_->createCompositeExtract(reg(0), type_float_, 3)});
+    put(2, {builder_->createCompositeExtract(reg(1), type_float_, 0),
+            builder_->createCompositeExtract(reg(1), type_float_, 1),
+            builder_->createCompositeExtract(reg(1), type_float_, 2),
+            builder_->createCompositeExtract(reg(1), type_float_, 3)});
+    put(3, {builder_->createCompositeExtract(reg(6), type_float_, 0),
+            builder_->createCompositeExtract(reg(6), type_float_, 1),
+            builder_->createCompositeExtract(reg(6), type_float_, 2),
+            builder_->createCompositeExtract(reg(6), type_float_, 3)});
   };
 
   if (!IsDivergentGatherPrepass()) {
@@ -3916,13 +3984,11 @@ spv::Id SpirvShaderTranslator::LoadDivergentFloatConstant(
   spv::Id a0 =
       builder_->createLoad(var_main_address_register_, spv::NoPrecision);
   spv::Id value = load_const(static_offset);
-  // XE_DGATHER_SCANMAX caps the scan for A/B testing. NOTE: as of this writing
-  // the full scan does NOT fix the invisible Halo 3 bodies - a diag readback
-  // (XE_DGATHER_DIAG) confirms the pre-pass writes and the vertex shader reads
-  // byte-identical, correct per-vertex c[16+a0] bone matrices, yet the skinned
-  // position still collapses. So the root cause is not the divergent read
-  // alone. XE_DGATHER_SCANMAX=1 (bone 0's matrix for every read, == forcing
-  // a0 = 0) renders the bodies in bind pose, which is the current stopgap.
+  // XE_DGATHER_SCANMAX caps the scan for A/B testing. NOTE: the divergent
+  // c[a0] read is NOT the bug (see the header) - the full scan delivers
+  // byte-identical, correct c[16+a0] bone matrices to the vertex shader (diag
+  // readback), yet the skinned character still renders wrong; forcing every
+  // read to bone 0 (XE_DGATHER_SCANMAX=1, == a0 forced to 0) "renders" it.
   uint32_t dg_scan_n = std::getenv("XE_DGATHER_SCANMAX")
                            ? uint32_t(atoi(std::getenv("XE_DGATHER_SCANMAX")))
                            : kDivergentGatherBoneScanCount;

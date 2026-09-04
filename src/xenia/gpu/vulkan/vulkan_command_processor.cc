@@ -584,7 +584,8 @@ bool VulkanCommandProcessor::SetupContext() {
         VkDeviceSize(
             divergent_gather_diag
                 ? SpirvShaderTranslator::kDivergentGatherDiagVsBaseVec4 +
-                      SpirvShaderTranslator::kDivergentGatherMaxVertices
+                      SpirvShaderTranslator::kDivergentGatherMaxVertices *
+                          SpirvShaderTranslator::kDivergentGatherDiagStrideVec4
                 : SpirvShaderTranslator::kDivergentGatherResultsBaseVec4 +
                       VkDeviceSize(
                           SpirvShaderTranslator::kDivergentGatherMaxVertices) *
@@ -1621,7 +1622,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
             16u;
         VkDeviceSize dg_size =
             VkDeviceSize(SpirvShaderTranslator::kDivergentGatherMaxVertices) *
-            2u * 16u;
+            SpirvShaderTranslator::kDivergentGatherDiagStrideVec4 * 2u * 16u;
         void* mapped = nullptr;
         if (dg_dfn.vkMapMemory(dg_dev->device(), divergent_gather_buffer_memory_,
                                dg_off, dg_size, 0, &mapped) == VK_SUCCESS) {
@@ -1630,9 +1631,9 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
           if (f) {
             std::fwrite(mapped, 1, dg_size, f);
             std::fclose(f);
-            XELOGI("XE_DGATHER_DIAG wrote {} ({} bytes; [0..1MiB)=pre-pass, "
-                   "[1MiB..2MiB)=vertex shader, float4 per raw index & 0xFFFF: "
-                   "x=a0 y=static_offset z=raw_index)",
+            XELOGI("XE_DGATHER_DIAG wrote {} ({} bytes; first half=pre-pass, "
+                   "second half=vertex shader; 4 float4 per raw idx&0xFFFF: "
+                   "[0]={{a0,val.x,val.w,raw}} [1]=r0 [2]=r1 [3]=r6)",
                    path, dg_size);
           }
           dg_dfn.vkUnmapMemory(dg_dev->device(), divergent_gather_buffer_memory_);
