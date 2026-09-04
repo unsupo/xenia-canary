@@ -427,6 +427,67 @@ spv::Id SpirvShaderTranslator::Depth20e4To32(SpirvBuilder& builder,
 }
 
 void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
+  // XE_DGATHER_DIAG (hash-filtered): snapshot a guest register per screen pixel
+  // right after the guest ALU, before the render-backend alpha test / export.
+  // Keyed by min(y,H-1)*W + min(x,W-1); last fragment covering the pixel wins.
+  // Register index is XE_DGATHER_PSREG (default 0). Stored as {rN.xyz, 1.0}.
+  if (buffer_divergent_gather_ != spv::NoResult &&
+      input_fragment_coordinates_ != spv::NoResult &&
+      var_main_registers_ != spv::NoResult && DivergentGatherDiagEnabled()) {
+    const char* psreg_env = std::getenv("XE_DGATHER_PSREG");
+    int psreg = psreg_env ? atoi(psreg_env) : 0;
+    spv::Id frag_coord =
+        builder_->createLoad(input_fragment_coordinates_, spv::NoPrecision);
+    spv::Id px = builder_->createUnaryOp(
+        spv::OpConvertFToU, type_uint_,
+        builder_->createCompositeExtract(frag_coord, type_float_, 0));
+    spv::Id py = builder_->createUnaryOp(
+        spv::OpConvertFToU, type_uint_,
+        builder_->createCompositeExtract(frag_coord, type_float_, 1));
+    id_vector_temp_util_.clear();
+    id_vector_temp_util_.push_back(px);
+    id_vector_temp_util_.push_back(
+        builder_->makeUintConstant(kDivergentGatherDiagPsWidth - 1));
+    px = builder_->createBuiltinCall(type_uint_, ext_inst_glsl_std_450_,
+                                     GLSLstd450UMin, id_vector_temp_util_);
+    id_vector_temp_util_.clear();
+    id_vector_temp_util_.push_back(py);
+    id_vector_temp_util_.push_back(
+        builder_->makeUintConstant(kDivergentGatherDiagPsHeight - 1));
+    py = builder_->createBuiltinCall(type_uint_, ext_inst_glsl_std_450_,
+                                     GLSLstd450UMin, id_vector_temp_util_);
+    spv::Id key = builder_->createBinOp(
+        spv::OpIAdd, type_uint_,
+        builder_->createBinOp(
+            spv::OpIMul, type_uint_, py,
+            builder_->makeUintConstant(kDivergentGatherDiagPsWidth)),
+        px);
+    spv::Id element = builder_->createBinOp(
+        spv::OpIAdd, type_uint_,
+        builder_->makeUintConstant(kDivergentGatherDiagPsBaseVec4), key);
+    id_vector_temp_util_.clear();
+    id_vector_temp_util_.push_back(builder_->makeIntConstant(psreg));
+    spv::Id reg = builder_->createLoad(
+        builder_->createAccessChain(spv::StorageClassFunction,
+                                    var_main_registers_, id_vector_temp_util_),
+        spv::NoPrecision);
+    id_vector_temp_util_.clear();
+    id_vector_temp_util_.push_back(const_int_0_);
+    id_vector_temp_util_.push_back(
+        builder_->createUnaryOp(spv::OpBitcast, type_int_, element));
+    spv::Id ptr = builder_->createAccessChain(spv::StorageClassStorageBuffer,
+                                              buffer_divergent_gather_,
+                                              id_vector_temp_util_);
+    builder_->createStore(
+        builder_->createCompositeConstruct(
+            type_float4_,
+            {builder_->createCompositeExtract(reg, type_float_, 0),
+             builder_->createCompositeExtract(reg, type_float_, 1),
+             builder_->createCompositeExtract(reg, type_float_, 2),
+             builder_->makeFloatConstant(1.0f)}),
+        ptr);
+  }
+
   // Loaded if needed.
   spv::Id msaa_samples = spv::NoResult;
 

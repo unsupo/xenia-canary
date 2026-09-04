@@ -392,6 +392,27 @@ class SpirvShaderTranslator : public ShaderTranslator {
   static constexpr uint32_t kDivergentGatherDiagVsBaseVec4 =
       kDivergentGatherDiagPreBaseVec4 +
       kDivergentGatherMaxVertices * kDivergentGatherDiagStrideVec4;
+  // XE_DGATHER_DIAG pixel-shader probe: one vec4 per screen pixel, keyed by
+  // min(y,H-1)*W + min(x,W-1), holding {r0.x, r0.y, r0.z, 1.0} written at the
+  // top of CompleteFragmentShaderInMain (last fragment wins). Hash-filtered.
+  static constexpr uint32_t kDivergentGatherDiagPsWidth = 1280;
+  static constexpr uint32_t kDivergentGatherDiagPsHeight = 720;
+  static constexpr uint32_t kDivergentGatherDiagPsBaseVec4 =
+      kDivergentGatherDiagVsBaseVec4 +
+      kDivergentGatherMaxVertices * kDivergentGatherDiagStrideVec4;
+  static constexpr uint32_t kDivergentGatherDiagPsEndVec4 =
+      kDivergentGatherDiagPsBaseVec4 +
+      kDivergentGatherDiagPsWidth * kDivergentGatherDiagPsHeight;
+  // XE_DGATHER_DIAG vertex-shader screen grid: same W*H grid, keyed by the
+  // guest oPos projected to screen (y flipped), storing guest oPos (xyzw, so
+  // w survives) at the top of CompleteVertexOrTessEvalShaderInMain. Lets the VS
+  // position be compared to the PS grid without vertex-index aliasing across
+  // the many draws that share a shader. Skipped for oPos.w <= 0.
+  static constexpr uint32_t kDivergentGatherDiagVsGridBaseVec4 =
+      kDivergentGatherDiagPsEndVec4;
+  static constexpr uint32_t kDivergentGatherDiagVsGridEndVec4 =
+      kDivergentGatherDiagVsGridBaseVec4 +
+      kDivergentGatherDiagPsWidth * kDivergentGatherDiagPsHeight;
   // Pre-pass push constant sentinel: the draw is non-indexed, so
   // gl_GlobalInvocationID.x is the raw vertex index directly.
   static constexpr uint32_t kDivergentGatherSequentialIndices = 0xFFFFFFFFu;

@@ -2664,6 +2664,62 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
 
 void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
   if (IsDivergentGatherPrepass()) {
+    // XE_DGATHER_DIAG: draw-isolated register snapshot at the end of the guest
+    // body (all skinning done). Keyed by the raw vertex index (no aliasing
+    // within one draw), gated by push.index_count == XE_DGATHER_IDXCOUNT so a
+    // single draw among the many that share the shader can be inspected.
+    // Region: kDivergentGatherDiagPreBaseVec4, stride 20; slots [5+k] = r(3+k)
+    // for k in 0..8 (r3..r11: blended matrix rows r3/r4/r5, position vector r6,
+    // fetched TBN r7, and the rest).
+    const char* idxc_env = std::getenv("XE_DGATHER_IDXCOUNT");
+    if (buffer_divergent_gather_ != spv::NoResult &&
+        DivergentGatherDiagEnabled() && input_vertex_index_ != spv::NoResult &&
+        var_main_registers_ != spv::NoResult &&
+        push_constants_divergent_gather_ != spv::NoResult && idxc_env) {
+      spv::Id want = builder_->makeUintConstant(uint32_t(atoi(idxc_env)));
+      id_vector_temp_util_.clear();
+      id_vector_temp_util_.push_back(builder_->makeIntConstant(1));
+      spv::Id idx_count = builder_->createLoad(
+          builder_->createAccessChain(spv::StorageClassPushConstant,
+                                      push_constants_divergent_gather_,
+                                      id_vector_temp_util_),
+          spv::NoPrecision);
+      spv::Id match = builder_->createBinOp(spv::OpIEqual, type_bool_, idx_count,
+                                            want);
+      spv::Id raw = builder_->createLoad(input_vertex_index_, spv::NoPrecision);
+      spv::Id key = builder_->createBinOp(
+          spv::OpBitwiseAnd, type_uint_,
+          builder_->createUnaryOp(spv::OpBitcast, type_uint_, raw),
+          builder_->makeUintConstant(0xFFFF));
+      // Land non-matching draws on index 0 (ignored host-side).
+      key = builder_->createTriOp(spv::OpSelect, type_uint_, match, key,
+                                  const_uint_0_);
+      spv::Id base = builder_->createBinOp(
+          spv::OpIAdd, type_uint_,
+          builder_->makeUintConstant(kDivergentGatherDiagPreBaseVec4),
+          builder_->createBinOp(
+              spv::OpIMul, type_uint_, key,
+              builder_->makeUintConstant(kDivergentGatherDiagStrideVec4)));
+      for (int k = 0; k < 9; ++k) {
+        id_vector_temp_util_.clear();
+        id_vector_temp_util_.push_back(builder_->makeIntConstant(3 + k));
+        spv::Id rv = builder_->createLoad(
+            builder_->createAccessChain(spv::StorageClassFunction,
+                                        var_main_registers_,
+                                        id_vector_temp_util_),
+            spv::NoPrecision);
+        id_vector_temp_util_.clear();
+        id_vector_temp_util_.push_back(const_int_0_);
+        id_vector_temp_util_.push_back(builder_->createUnaryOp(
+            spv::OpBitcast, type_int_,
+            builder_->createBinOp(spv::OpIAdd, type_uint_, base,
+                                  builder_->makeUintConstant(5 + k))));
+        builder_->createStore(
+            rv, builder_->createAccessChain(spv::StorageClassStorageBuffer,
+                                            buffer_divergent_gather_,
+                                            id_vector_temp_util_));
+      }
+    }
     // The compute pre-pass only fills the gather buffer - no clip position,
     // interpolators or clip/cull distances to finalize.
     return;
@@ -2714,6 +2770,71 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
                                                   var_main_registers_,
                                                   id_vector_temp_util_),
                       spv::NoPrecision));
+    }
+
+    // Also write guest oPos into a screen-space grid (y flipped), keyed by the
+    // projected position, so the VS footprint can be compared to the PS grid
+    // without vertex-index aliasing across draws. oPos.w <= 0 -> pixel (0,0).
+    {
+      auto ext = [&](spv::Id v, int c) {
+        return builder_->createCompositeExtract(v, type_float_, c);
+      };
+      spv::Id w = ext(guest_position, 3);
+      spv::Id valid = builder_->createBinOp(spv::OpFOrdGreaterThan, type_bool_, w,
+                                            builder_->makeFloatConstant(1e-6f));
+      spv::Id inv_w = builder_->createBinOp(spv::OpFDiv, type_float_,
+                                            builder_->makeFloatConstant(1.0f), w);
+      auto clamp01 = [&](spv::Id ndc, bool flip, uint32_t dim) {
+        // (flip ? 0.5 - ndc*0.5 : ndc*0.5 + 0.5) * dim, clamped to [0, dim-1].
+        spv::Id half = builder_->createBinOp(spv::OpFMul, type_float_, ndc,
+                                             builder_->makeFloatConstant(0.5f));
+        spv::Id s =
+            flip ? builder_->createBinOp(spv::OpFSub, type_float_,
+                                         builder_->makeFloatConstant(0.5f), half)
+                 : builder_->createBinOp(spv::OpFAdd, type_float_, half,
+                                         builder_->makeFloatConstant(0.5f));
+        s = builder_->createBinOp(spv::OpFMul, type_float_, s,
+                                  builder_->makeFloatConstant(float(dim)));
+        id_vector_temp_util_.clear();
+        id_vector_temp_util_.push_back(s);
+        id_vector_temp_util_.push_back(builder_->makeFloatConstant(0.0f));
+        s = builder_->createBuiltinCall(type_float_, ext_inst_glsl_std_450_,
+                                        GLSLstd450FMax, id_vector_temp_util_);
+        spv::Id u = builder_->createUnaryOp(spv::OpConvertFToU, type_uint_, s);
+        id_vector_temp_util_.clear();
+        id_vector_temp_util_.push_back(u);
+        id_vector_temp_util_.push_back(builder_->makeUintConstant(dim - 1));
+        return builder_->createBuiltinCall(type_uint_, ext_inst_glsl_std_450_,
+                                           GLSLstd450UMin, id_vector_temp_util_);
+      };
+      spv::Id sx = clamp01(
+          builder_->createBinOp(spv::OpFMul, type_float_, ext(guest_position, 0),
+                                inv_w),
+          false, kDivergentGatherDiagPsWidth);
+      spv::Id sy = clamp01(
+          builder_->createBinOp(spv::OpFMul, type_float_, ext(guest_position, 1),
+                                inv_w),
+          true, kDivergentGatherDiagPsHeight);
+      spv::Id key = builder_->createBinOp(
+          spv::OpIAdd, type_uint_,
+          builder_->createBinOp(
+              spv::OpIMul, type_uint_, sy,
+              builder_->makeUintConstant(kDivergentGatherDiagPsWidth)),
+          sx);
+      key = builder_->createTriOp(spv::OpSelect, type_uint_, valid, key,
+                                  const_uint_0_);
+      spv::Id elem = builder_->createBinOp(
+          spv::OpIAdd, type_uint_,
+          builder_->makeUintConstant(kDivergentGatherDiagVsGridBaseVec4), key);
+      id_vector_temp_util_.clear();
+      id_vector_temp_util_.push_back(const_int_0_);
+      id_vector_temp_util_.push_back(
+          builder_->createUnaryOp(spv::OpBitcast, type_int_, elem));
+      builder_->createStore(
+          guest_position,
+          builder_->createAccessChain(spv::StorageClassStorageBuffer,
+                                      buffer_divergent_gather_,
+                                      id_vector_temp_util_));
     }
   }
 
@@ -3080,6 +3201,16 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
 void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
   Modification shader_modification = GetSpirvShaderModification();
 
+  // XE_DGATHER_DIAG (hash-filtered): declare the gather storage buffer so the
+  // pixel shader can dump a per-pixel register snapshot. Mutually exclusive with
+  // the FSI EDRAM bindings (which reuse set 0 binding 1); on MoltenVK FSI is off.
+  const bool dg_ps_diag = !edram_fragment_shader_interlock_ &&
+                          !is_depth_only_fragment_shader_ &&
+                          DivergentGatherDiagEnabled();
+  if (dg_ps_diag) {
+    DeclareDivergentGatherBuffer();
+  }
+
   if (edram_fragment_shader_interlock_) {
     builder_->addExtension("SPV_EXT_fragment_shader_interlock");
 
@@ -3193,7 +3324,7 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
   // - and must do so per-sample for MSAA antialiasing of intersections.
   bool need_frag_coord =
       edram_fragment_shader_interlock_ || param_gen_needed || IsSampleRate() ||
-      DSV_IsApplyingPolygonOffset() ||
+      DSV_IsApplyingPolygonOffset() || dg_ps_diag ||
       (!edram_fragment_shader_interlock_ && !is_depth_only_fragment_shader_ &&
        current_shader().writes_color_target(0) &&
        !IsExecutionModeEarlyFragmentTests());

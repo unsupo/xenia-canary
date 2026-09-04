@@ -407,8 +407,9 @@ bool VulkanCommandProcessor::SetupContext() {
         SpirvShaderTranslator::kDivergentGatherSharedMemorySetBinding;
     gather_binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     gather_binding.descriptorCount = 1;
-    gather_binding.stageFlags =
-        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
+    gather_binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT |
+                                VK_SHADER_STAGE_COMPUTE_BIT |
+                                VK_SHADER_STAGE_FRAGMENT_BIT;
     gather_binding.pImmutableSamplers = nullptr;
     shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount =
         SpirvShaderTranslator::kDivergentGatherSharedMemorySetBinding + 1;
@@ -583,9 +584,7 @@ bool VulkanCommandProcessor::SetupContext() {
     VkDeviceSize kDivergentGatherBufferSize =
         VkDeviceSize(
             divergent_gather_diag
-                ? SpirvShaderTranslator::kDivergentGatherDiagVsBaseVec4 +
-                      SpirvShaderTranslator::kDivergentGatherMaxVertices *
-                          SpirvShaderTranslator::kDivergentGatherDiagStrideVec4
+                ? SpirvShaderTranslator::kDivergentGatherDiagPsEndVec4
                 : SpirvShaderTranslator::kDivergentGatherResultsBaseVec4 +
                       VkDeviceSize(
                           SpirvShaderTranslator::kDivergentGatherMaxVertices) *
@@ -1637,6 +1636,51 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                    "[4]=oPos [5+r]=rN for r in 0..11 (r11=slot 16))",
                    path, dg_size,
                    SpirvShaderTranslator::kDivergentGatherDiagStrideVec4);
+          }
+          dg_dfn.vkUnmapMemory(dg_dev->device(), divergent_gather_buffer_memory_);
+        }
+        // Pixel-shader probe region: one vec4 per screen pixel (W*H), keyed by
+        // min(y,H-1)*W + min(x,W-1), holding {rN.xyz, 1.0}.
+        VkDeviceSize ps_off =
+            VkDeviceSize(SpirvShaderTranslator::kDivergentGatherDiagPsBaseVec4) *
+            16u;
+        VkDeviceSize ps_size =
+            VkDeviceSize(SpirvShaderTranslator::kDivergentGatherDiagPsWidth) *
+            SpirvShaderTranslator::kDivergentGatherDiagPsHeight * 16u;
+        void* ps_mapped = nullptr;
+        if (dg_dfn.vkMapMemory(dg_dev->device(), divergent_gather_buffer_memory_,
+                               ps_off, ps_size, 0, &ps_mapped) == VK_SUCCESS) {
+          std::string path = fmt::format("{}_dgdiag_ps.raw", dg_diag);
+          FILE* f = std::fopen(path.c_str(), "wb");
+          if (f) {
+            std::fwrite(ps_mapped, 1, ps_size, f);
+            std::fclose(f);
+            XELOGI("XE_DGATHER_DIAG wrote {} ({} bytes; {}x{} float4 grid, "
+                   "pixel = {{rN.xyz, 1.0}} at min(y,H-1)*W+min(x,W-1))",
+                   path, ps_size,
+                   SpirvShaderTranslator::kDivergentGatherDiagPsWidth,
+                   SpirvShaderTranslator::kDivergentGatherDiagPsHeight);
+          }
+          dg_dfn.vkUnmapMemory(dg_dev->device(), divergent_gather_buffer_memory_);
+        }
+        // Vertex-shader screen grid: guest oPos (xyzw) keyed by projected pos.
+        VkDeviceSize vg_off =
+            VkDeviceSize(
+                SpirvShaderTranslator::kDivergentGatherDiagVsGridBaseVec4) *
+            16u;
+        void* vg_mapped = nullptr;
+        if (dg_dfn.vkMapMemory(dg_dev->device(), divergent_gather_buffer_memory_,
+                               vg_off, ps_size, 0, &vg_mapped) == VK_SUCCESS) {
+          std::string path = fmt::format("{}_dgdiag_vsgrid.raw", dg_diag);
+          FILE* f = std::fopen(path.c_str(), "wb");
+          if (f) {
+            std::fwrite(vg_mapped, 1, ps_size, f);
+            std::fclose(f);
+            XELOGI("XE_DGATHER_DIAG wrote {} ({} bytes; {}x{} float4 grid, "
+                   "pixel = guest oPos xyzw at projected screen pos)",
+                   path, ps_size,
+                   SpirvShaderTranslator::kDivergentGatherDiagPsWidth,
+                   SpirvShaderTranslator::kDivergentGatherDiagPsHeight);
           }
           dg_dfn.vkUnmapMemory(dg_dev->device(), divergent_gather_buffer_memory_);
         }
