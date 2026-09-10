@@ -11,6 +11,8 @@
 
 #include "xenia/base/atomic.h"
 #include "xenia/base/clock.h"
+#include "xenia/base/cvar.h"
+#include "xenia/base/memory.h"
 #include "xenia/base/platform.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/kernel/util/shim_utils.h"
@@ -508,7 +510,51 @@ dword_result_t KeDelayExecutionThread_entry(dword_t processor_mode,
 DECLARE_XBOXKRNL_EXPORT3(KeDelayExecutionThread, kThreading, kImplemented,
                          kBlocking, kHighFrequency);
 
-dword_result_t NtYieldExecution_entry() {
+DEFINE_bool(log_guest_yield_spin, false,
+            "macos-arm64 bring-up: log the guest LR + fence values when a "
+            "thread spins on NtYieldExecution (CPU<->GPU deadlock trace).",
+            "Kernel");
+
+dword_result_t NtYieldExecution_entry(const ppc_context_t& ctx) {
+  // macos-arm64 Fable II bring-up: the game wedges at the title screen with two
+  // guest threads spinning on NtYieldExecution. Log where they spin (guest LR)
+  // and the value they're waiting on, once per wedge, so the CPU<->GPU deadlock
+  // can be traced without lldb. A "wedge" = the same guest LR calling us
+  // thousands of times in a row.
+  if (cvars::log_guest_yield_spin) {
+    // Report a *sustained* same-site spin (a real wedge, not the short yield
+    // bursts of normal play). Fully traced for Fable II's title-screen wedge:
+    // guest thread 0x15 (D3D resource producer) spins at lr=0x82CBD0A8 ->
+    // caller 0x822E062C -> pred 0x822A8E78 -> ring-advance 0x822943E8 (Rtl*
+    // CriticalSection-protected), polling *(pool[+4] + round4(pool[+0xC])) for a
+    // non-zero completion token. The pool's producer index pool[+0x3C] never
+    // advances past the consumer index pool[+0xC] - nothing ever posts to this
+    // GPU-resource completion ring. r31 = the pool struct (e.g. 0x42205100).
+    static thread_local uint32_t last_lr = 0;
+    static thread_local uint64_t run = 0;
+    uint32_t lr = static_cast<uint32_t>(ctx->lr);
+    if (lr == last_lr) {
+      ++run;
+      if (run == 300000 || (run > 300000 && (run % 2000000) == 0)) {
+        auto gv = [&](uint32_t a) {
+          return a ? xe::load_and_swap<uint32_t>(ctx->TranslateVirtual(a)) : 0u;
+        };
+        uint32_t r31 = uint32_t(ctx->r[31]);
+        uint32_t pbase = gv(r31 + 4);
+        uint32_t poc = gv(r31 + 0xC);
+        uint32_t slot = pbase + ((poc + 3) & ~3u);
+        XELOGW(
+            "guest yield-spin @lr={:08X} run={} r31(pool)={:08X}: ring={:08X} "
+            "consumer_idx={:08X} producer_idx={:08X} cached={:08X} "
+            "poll[{:08X}]={:08X}  (nothing posting to this ring -> wedge)",
+            lr, run, r31, pbase, poc, gv(r31 + 0x3C), gv(r31 + 0x10), slot,
+            gv(slot));
+      }
+    } else {
+      last_lr = lr;
+      run = 0;
+    }
+  }
   xe::threading::MaybeYield();
   return 0;
 }
