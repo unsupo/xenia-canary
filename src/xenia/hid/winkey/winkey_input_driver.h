@@ -10,9 +10,12 @@
 #ifndef XENIA_HID_WINKEY_WINKEY_INPUT_DRIVER_H_
 #define XENIA_HID_WINKEY_WINKEY_INPUT_DRIVER_H_
 
+#include <array>
+#include <atomic>
 #include <queue>
 
 #include "xenia/base/mutex.h"
+#include "xenia/base/platform.h"
 #include "xenia/hid/input_driver.h"
 #include "xenia/ui/virtual_key.h"
 
@@ -70,6 +73,17 @@ class WinKeyInputDriver final : public InputDriver {
 
   void OnKey(ui::KeyEvent& e, bool is_down);
 
+  // Whether a virtual key is currently held / has its toggle bit set. On
+  // Windows these read the live keyboard state via GetAsyncKeyState/GetKeyState;
+  // on other platforms (macOS) there is no such API for a background poll, so
+  // they read key_state_/key_toggle_, which OnKey() maintains from the window's
+  // key events.
+  bool IsKeyDown(uint8_t virtual_key) const;
+  bool IsKeyToggled(uint8_t virtual_key) const;
+  bool IsKeyDown(ui::VirtualKey virtual_key) const {
+    return IsKeyDown(static_cast<uint8_t>(virtual_key));
+  }
+
   WinKeyWindowInputListener window_input_listener_;
 
   xe::global_critical_region global_critical_region_;
@@ -77,6 +91,11 @@ class WinKeyInputDriver final : public InputDriver {
   std::vector<KeyBinding> key_bindings_;
   uint8_t key_map_[256];
   uint32_t packet_number_ = 1;
+
+#if !XE_PLATFORM_WIN32
+  std::array<std::atomic<bool>, 256> key_state_{};
+  std::array<std::atomic<uint8_t>, 256> key_toggle_{};
+#endif
 };
 
 }  // namespace winkey

@@ -18,6 +18,13 @@
 #include "xenia/base/math.h"
 #include "xenia/base/platform.h"
 
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <atomic>
+#endif
+
 #ifndef __APPLE__
 
 namespace xe {
@@ -365,6 +372,67 @@ static void DarwinExceptionHandlerCallback(int signal_number, siginfo_t* signal_
       return;
     }
   }
+
+#if XE_ARCH_ARM64
+  // macos-arm64 Fable II bring-up: last-resort recovery for a guest write that
+  // faulted on a mapped-but-read-only page none of the registered handlers
+  // claimed. This happens for stores through the 0xE0000000 physical-mirror
+  // window whose page-table protection in the vE0000000 heap view is stale
+  // relative to the physical heap (the +0x1000 host-page-offset mirror doesn't
+  // stay in sync), so PhysicalHeap::TriggerCallbacks sees no watch and
+  // SystemPageGuestAccess reports the page not-writable even though the
+  // physical page IS committed and writable through its other views. Rather
+  // than crash the title, make the faulting page writable and retry. Worst
+  // case is a missed texture/vertex-cache invalidation for that page.
+  if ((signal_number == SIGSEGV || signal_number == SIGBUS) &&
+      ex.code() == Exception::Code::kAccessViolation && signal_info->si_addr) {
+    static std::atomic<uint32_t> recover_warn{0};
+    uintptr_t fault = reinterpret_cast<uintptr_t>(signal_info->si_addr);
+    // Only touch the guest address space: xenia maps it at a power-of-two base
+    // (virtual_membase) with the physical mirror +4 GiB, spanning well under
+    // 16 GiB. A host stack/heap/library address won't be page-RO-and-writable
+    // after mprotect, but scope it anyway to the 4 GiB..64 GiB range the guest
+    // windows always land in.
+    if (fault >= 0x100000000ull && fault < 0x1000000000ull) {
+      long page = sysconf(_SC_PAGESIZE);
+      uintptr_t page_base = fault & ~uintptr_t(page - 1);
+      vm_address_t region = page_base;
+      vm_size_t region_size = 0;
+      vm_region_basic_info_data_64_t info;
+      mach_msg_type_number_t info_count = VM_REGION_BASIC_INFO_COUNT_64;
+      mach_port_t obj = MACH_PORT_NULL;
+      bool mapped_ro = false;
+      if (vm_region_64(mach_task_self(), &region, &region_size,
+                       VM_REGION_BASIC_INFO_64,
+                       reinterpret_cast<vm_region_info_t>(&info), &info_count,
+                       &obj) == KERN_SUCCESS &&
+          region <= page_base && (info.protection & VM_PROT_READ) &&
+          !(info.protection & VM_PROT_WRITE)) {
+        mapped_ro = true;
+      }
+      if (mapped_ro &&
+          mprotect(reinterpret_cast<void*>(page_base), size_t(page),
+                   PROT_READ | PROT_WRITE) == 0) {
+        // Signal-handler context: no logging here (the fault may have
+        // interrupted the logger). A one-line stderr note, rate-limited, is
+        // async-signal tolerable and enough to know it fired.
+        uint32_t n = recover_warn.fetch_add(1, std::memory_order_relaxed);
+        if (n == 0 || (n & 0xFFF) == 0) {
+          char buf[128];
+          int len = snprintf(buf, sizeof(buf),
+                             "[exception_handler] recovered guest write fault "
+                             "at %p (count %u)\n",
+                             signal_info->si_addr, n + 1);
+          if (len > 0) {
+            ssize_t w = write(STDERR_FILENO, buf, size_t(len));
+            (void)w;
+          }
+        }
+        return;
+      }
+    }
+  }
+#endif
 
   signal(signal_number, SIG_DFL);
   raise(signal_number);

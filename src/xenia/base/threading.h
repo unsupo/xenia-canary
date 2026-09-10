@@ -493,6 +493,15 @@ class Thread : public WaitHandle {
   // threads that had been waiting for the thread to terminate.
   virtual void Terminate(int exit_code) = 0;
 
+  // TEMP DIAGNOSTIC (macos-arm64 investigation): returns this thread's
+  // current host program counter, or 0 if unsupported/unavailable. Lets a
+  // watchdog sample where a thread actually is without an external debugger
+  // (which on this host can't reliably call back into the target process -
+  // ARM64 pointer authentication rejects a synthetically-constructed call).
+  virtual uint64_t GetCurrentProgramCounter() const { return 0; }
+  // TEMP DIAGNOSTIC (macos-arm64 investigation): see threading_posix.cc.
+  virtual uint64_t GetCurrentStackPointer() const { return 0; }
+
  protected:
   std::string name_;
 };

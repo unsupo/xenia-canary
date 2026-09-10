@@ -130,7 +130,10 @@ class VulkanTextureCache final : public TextureCache {
   // or VK_NULL_HANDLE in case of failure. May call LoadTextureData.
   VkImageView RequestSwapTexture(uint32_t& width_scaled_out,
                                  uint32_t& height_scaled_out,
-                                 xenos::TextureFormat& format_out);
+                                 xenos::TextureFormat& format_out,
+                                 uint32_t frontbuffer_ptr = 0,
+                                 uint32_t frontbuffer_width = 0,
+                                 uint32_t frontbuffer_height = 0);
 
   // Scaled resolve buffer management (for use by VulkanRenderTargetCache)
   // Simple non-overlapping buffer (fallback when sparse binding unavailable)

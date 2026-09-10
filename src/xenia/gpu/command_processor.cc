@@ -305,12 +305,19 @@ void CommandProcessor::RestoreGammaRamp(
 }
 
 void CommandProcessor::CallInThread(std::function<void()> fn) {
-  if (pending_fns_.empty() &&
-      kernel::XThread::IsInThread(worker_thread_.get())) {
-    fn();
-  } else {
-    pending_fns_.push(std::move(fn));
+  if (kernel::XThread::IsInThread(worker_thread_.get())) {
+    bool empty;
+    {
+      std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+      empty = pending_fns_.empty();
+    }
+    if (empty) {
+      fn();
+      return;
+    }
   }
+  std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+  pending_fns_.push(std::move(fn));
 }
 
 void CommandProcessor::ClearCaches() {}
@@ -333,9 +340,16 @@ void CommandProcessor::WorkerThreadMain() {
   }
 
   while (worker_running_) {
-    while (!pending_fns_.empty()) {
-      auto fn = std::move(pending_fns_.front());
-      pending_fns_.pop();
+    for (;;) {
+      std::function<void()> fn;
+      {
+        std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+        if (pending_fns_.empty()) {
+          break;
+        }
+        fn = std::move(pending_fns_.front());
+        pending_fns_.pop();
+      }
       fn();
     }
 
@@ -370,6 +384,15 @@ void CommandProcessor::WorkerThreadMain() {
 
     // Execute. Note that we handle wraparound transparently.
     read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
+
+    // The ring is now drained up to write_ptr_index - i.e. every submission
+    // the guest has kicked off so far has been fully processed. Publish that
+    // as the GPU's "completed submissions" count so the guest's frame-pacing
+    // fence (VdSetSystemCommandBufferGpuIdentifierAddress) resolves.
+    if (graphics_system_) {
+      graphics_system_->SetGpuIdentifierValue(
+          kickoff_count_.load(std::memory_order_relaxed));
+    }
 
     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
     //     that many indices.
@@ -487,12 +510,29 @@ XE_NOINLINE XE_COLD void CommandProcessor::LogKickoffInitator(uint32_t value) {
 }
 
 void CommandProcessor::UpdateWritePointer(uint32_t value) {
-  XELOGI("CommandProcessor::UpdateWritePointer -> {:08X}", value);
+  // (Throttled - Fable II kicks the ring hundreds of times/frame and this
+  // XELOGI per kickoff, with the log write, is itself a slice of the lag.)
+  static std::atomic<uint32_t> wp_log{0};
+  if ((wp_log++ & 0x3FF) == 0) {
+    XELOGI("CommandProcessor::UpdateWritePointer -> {:08X}", value);
+  }
   XE_UNLIKELY_IF(cvars::log_ringbuffer_kickoff_initiator_bts) {
     LogKickoffInitator(value);
   }
   write_ptr_index_ = value;
   write_ptr_index_event_->SetBoostPriority();
+  // Count guest submissions ("kickoffs"). The guest's D3D frame pacing (via
+  // VdSetSystemCommandBufferGpuIdentifierAddress) waits for the GPU's
+  // completed-submission count to reach the submitted count. We publish that
+  // completed count from the worker once the ring is drained (below) - which
+  // for our instant GPU means "all submitted work is done".
+  kickoff_count_.fetch_add(1, std::memory_order_relaxed);
+  // Also refresh the pacing fence right here, on the submitting thread: it's
+  // about to check whether it may run ahead, and the guest can submit faster
+  // than the worker republishes.
+  if (graphics_system_) {
+    graphics_system_->PublishGpuIdentifier();
+  }
 }
 
 void CommandProcessor::LogRegisterSet(uint32_t register_index, uint32_t value) {
@@ -723,7 +763,13 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       HandleSpecialRegisterWrite(index, value);
     }
   } else {
-    XELOGW("CommandProcessor::WriteRegister index out of bounds: {}", index);
+    // macos-arm64 Fable II bring-up: PM4 desyncs (stale IB content) produce a
+    // flood of these - hundreds/frame - and logging each one (with flush)
+    // is itself a big part of the resulting lag. Throttle hard.
+    static std::atomic<uint32_t> warn{0};
+    if ((warn++ & 0x3FF) == 0) {
+      XELOGW("CommandProcessor::WriteRegister index out of bounds: {}", index);
+    }
     return;
   }
 }

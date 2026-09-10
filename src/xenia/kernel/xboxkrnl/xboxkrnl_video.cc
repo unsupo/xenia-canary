@@ -11,6 +11,7 @@
 
 #include "xenia/base/logging.h"
 #include "xenia/emulator.h"
+#include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
@@ -351,10 +352,15 @@ void VdGetSystemCommandBuffer_entry(lpunknown_t p0_ptr, lpunknown_t p1_ptr) {
 DECLARE_XBOXKRNL_EXPORT1(VdGetSystemCommandBuffer, kVideo, kStub);
 
 void VdSetSystemCommandBufferGpuIdentifierAddress_entry(lpunknown_t unk) {
-  // r3 = 0x2B10(d3d?) + 8
+  // r3 = the guest address where the GPU should publish its monotonic
+  // "identifier" (== the swap/interrupt counter). D3D's frame pacing spins on
+  // it; leaving it unwritten deadlocks titles (e.g. Fable II) on a black
+  // screen.
+  auto graphics_system = kernel_state()->emulator()->graphics_system();
+  graphics_system->SetGpuIdentifierAddress(unk.guest_address());
 }
 DECLARE_XBOXKRNL_EXPORT1(VdSetSystemCommandBufferGpuIdentifierAddress, kVideo,
-                         kStub);
+                         kImplemented);
 
 // VdVerifyMEInitCommand
 // r3
@@ -538,6 +544,26 @@ void VdSwap_entry(
   // Fill the rest of the buffer with NOP packets.
   for (uint32_t i = offset; i < 64; i++) {
     dwords[i] = xenos::MakePacketType2();
+  }
+
+  // Trigger IssueSwap directly on the GPU command processor thread.
+  // When games build system command buffers (Indirect Buffers) rather than
+  // writing directly into the primary ringbuffer, the PM4_XE_SWAP packet
+  // written above may be placed in a buffer region that is not referenced by
+  // the outer PM4_INDIRECT_BUFFER dispatch. Direct invocation ensures the
+  // swapchain present path is executed for every VdSwap call.
+  auto graphics_system = kernel_state()->emulator()->graphics_system();
+  if (graphics_system && graphics_system->command_processor()) {
+    auto cp = graphics_system->command_processor();
+    uint32_t fb_ptr = frontbuffer_physical_address;
+    uint32_t w = uint32_t(*width);
+    uint32_t h = uint32_t(*height);
+    cp->CallInThread([cp, graphics_system, fb_ptr, w, h, gpu_fetch]() {
+      if (graphics_system->register_file()) {
+        graphics_system->register_file()->SetTextureFetch(0, gpu_fetch);
+      }
+      cp->IssueSwap(fb_ptr, w, h);
+    });
   }
 }
 DECLARE_XBOXKRNL_EXPORT3(VdSwap, kVideo, kImplemented, kHighFrequency,

@@ -9,6 +9,8 @@
 
 #include "xenia/gpu/shader_interpreter.h"
 
+#include "xenia/base/logging.h"
+
 #include <cfloat>
 #include <cmath>
 #include <cstring>
@@ -25,7 +27,26 @@ void ShaderInterpreter::Execute() {
 
   bool exec_ended = false;
   uint32_t cf_index_next = 1;
+  // Hard ceiling on control-flow steps. A Xenos shader has at most 512 control-
+  // flow instructions; backward jumps / loops multiply that, but a real shader
+  // that reaches the interpreter (only simple position-only VS's do, gated by
+  // CanInterpretShader) converges quickly. A malformed or mis-analyzed shader
+  // (e.g. one whose ucode the estimator walked off the end of) can otherwise
+  // spin here forever - seen wedging the GPU command processor on Fable II
+  // (macos-arm64) inside DrawExtentEstimator. Bail out conservatively.
+  constexpr uint32_t kMaxControlFlowSteps = 8192;
+  uint32_t cf_step = 0;
   for (uint32_t cf_index = 0; !exec_ended; cf_index = cf_index_next) {
+    if (++cf_step > kMaxControlFlowSteps) {
+      static uint32_t warn_throttle = 0;
+      if ((warn_throttle++ & 0xFFF) == 0) {
+        XELOGW(
+            "ShaderInterpreter: control-flow step limit ({}) hit - abandoning "
+            "a malformed/runaway shader.",
+            kMaxControlFlowSteps);
+      }
+      break;
+    }
     cf_index_next = cf_index + 1;
 
     const uint32_t* cf_pair = &ucode_[3 * (cf_index >> 1)];

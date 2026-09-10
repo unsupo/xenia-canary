@@ -837,14 +837,83 @@ class PosixCondition<Thread> final : public PosixConditionBase {
     return 16 - nice_val;
   }
 
+  // TEMP DIAGNOSTIC (macos-arm64 investigation): current host PC, for a
+  // watchdog to sample without an external debugger (which can't reliably
+  // call back into this process - ARM64 PAC rejects a synthetic call).
+  uint64_t GetCurrentProgramCounter() const {
+#ifdef __APPLE__
+    WaitStarted();
+    mach_port_t mach_thread = pthread_mach_thread_np(thread_);
+    if (mach_thread == MACH_PORT_NULL) {
+      return 0;
+    }
+    arm_thread_state64_t state;
+    mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+    kern_return_t kr = thread_get_state(
+        mach_thread, ARM_THREAD_STATE64,
+        reinterpret_cast<thread_state_t>(&state), &count);
+    if (kr != KERN_SUCCESS) {
+      return 0;
+    }
+    return reinterpret_cast<uint64_t>(arm_thread_state64_get_pc(state));
+#else
+    return 0;
+#endif
+  }
+
+  // TEMP DIAGNOSTIC (macos-arm64 investigation): current host SP, so a
+  // watchdog can scan this thread's stack for plausible return addresses.
+  // The A64 JIT doesn't maintain an x29 frame-pointer chain (host return
+  // addresses are saved at a fixed per-function stack offset instead - see
+  // StackLayout::HOST_RET_ADDR in a64_emitter.cc), so a precise unwind isn't
+  // cheap to do generically here; a stack scan is an approximation, not a
+  // real backtrace, but is enough to reveal a caller this diagnostic
+  // otherwise has no way to find.
+  uint64_t GetCurrentStackPointer() const {
+#ifdef __APPLE__
+    WaitStarted();
+    mach_port_t mach_thread = pthread_mach_thread_np(thread_);
+    if (mach_thread == MACH_PORT_NULL) {
+      return 0;
+    }
+    arm_thread_state64_t state;
+    mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+    kern_return_t kr = thread_get_state(
+        mach_thread, ARM_THREAD_STATE64,
+        reinterpret_cast<thread_state_t>(&state), &count);
+    if (kr != KERN_SUCCESS) {
+      return 0;
+    }
+    return reinterpret_cast<uint64_t>(arm_thread_state64_get_sp(state));
+#else
+    return 0;
+#endif
+  }
+
   void set_priority(int new_priority) const {
     WaitStarted();
-    if (!fifo_failed_) {
+    // Only genuinely elevated-priority threads (Xenon real-time-class guest
+    // threads map to ThreadPriority::kAboveNormal/kHighest - see
+    // GuestPriorityToHost in xthread.cc) get SCHED_FIFO. SCHED_FIFO is
+    // real-time, run-to-completion scheduling: unlike SCHED_OTHER/nice, it
+    // does not fairly time-slice threads at the same priority, so a normal-
+    // or below-normal-priority guest thread that never voluntarily yields
+    // (e.g. a tight per-object update loop) could otherwise monopolize a
+    // core and starve every other thread at or below its priority. On Linux
+    // this whole path normally fails outright for an unprivileged process
+    // (EPERM), permanently falling back to nice; on macOS it can succeed
+    // unprivileged, so the same guest priority that's harmless on Linux/
+    // Windows can silently opt a thread into starvation-capable scheduling
+    // here. Below that threshold, always use the safe, fairly-time-sliced
+    // nice-based path.
+    constexpr int kMinFifoPriority = 24;  // ThreadPriority::kAboveNormal
+    if (!fifo_failed_ && new_priority >= kMinFifoPriority) {
       // Try real-time SCHED_FIFO for best priority control.
       sched_param param{};
       param.sched_priority = new_priority;
       int res = pthread_setschedparam(thread_, SCHED_FIFO, &param);
       if (res == 0) {
+        is_fifo_ = true;
         return;
       }
       if (res == EPERM) {
@@ -852,6 +921,17 @@ class PosixCondition<Thread> final : public PosixConditionBase {
       } else {
         XELOGW("Unexpected error {} while setting SCHED_FIFO priority", res);
         fifo_failed_ = true;
+      }
+    } else if (is_fifo_) {
+      // Dropping below the real-time threshold (e.g. quantum decay): a
+      // policy is sticky across setpriority()/nice changes, so without
+      // explicitly reverting it here this thread would stay under SCHED_FIFO
+      // - and thus still not fairly time-sliced against SCHED_OTHER threads,
+      // regardless of how low its nice-mapped priority number is - forever.
+      sched_param param{};
+      param.sched_priority = 0;
+      if (pthread_setschedparam(thread_, SCHED_OTHER, &param) == 0) {
+        is_fifo_ = false;
       }
     }
     // Fall back to nice values under SCHED_OTHER.
@@ -1058,6 +1138,7 @@ class PosixCondition<Thread> final : public PosixConditionBase {
   pthread_t thread_;
   pid_t tid_ = 0;                     // Kernel TID for setpriority() fallback
   mutable bool fifo_failed_ = false;  // True after SCHED_FIFO was rejected
+  mutable bool is_fifo_ = false;  // True while this thread is under SCHED_FIFO
   bool signaled_;
   int exit_code_;
   State state_;             // Protected by state_mutex_
@@ -1383,6 +1464,13 @@ class PosixThread final : public PosixConditionHandle<Thread> {
   int priority() override { return handle_.priority(); }
   void set_priority(int new_priority) override {
     handle_.set_priority(new_priority);
+  }
+
+  uint64_t GetCurrentProgramCounter() const override {
+    return handle_.GetCurrentProgramCounter();
+  }
+  uint64_t GetCurrentStackPointer() const override {
+    return handle_.GetCurrentStackPointer();
   }
 
   void QueueUserCallback(std::function<void()> callback) override {

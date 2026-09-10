@@ -310,6 +310,51 @@ inline XReg AddGuestMemoryOffset(A64Emitter& e, const XReg& base,
   return e.x0;
 }
 
+// Compute a guest memory address that's the sum of a base and an offset (a
+// struct-field/array-element style access), returning the XReg for
+// [x21, xN] addressing.
+//
+// This must NOT be implemented as AddGuestMemoryOffset(ComputeMemoryAddress
+// (base), offset): ComputeMemoryAddress's macOS host-page compensation
+// (see there for why it exists) is applied to the base alone, before the
+// offset is added. If the *true* address (base + offset) is what crosses
+// the 0xE0000000 threshold - base alone doesn't, e.g. a struct pointer a
+// few bytes below it plus a field offset - the compensation never fires,
+// and the access silently lands 0x1000 bytes short of where it should,
+// reading/writing whatever else lives there instead. Compute the raw,
+// uncompensated sum first, then compensate exactly once on the real
+// combined address, so it doesn't matter whether the crossing happens in
+// the base or via the offset.
+template <typename OffsetOp>
+inline XReg ComputeMemoryAddressWithOffset(A64Emitter& e, const I64Op& guest_base,
+                                           const OffsetOp& offset) {
+  using namespace Xbyak_aarch64;
+  // Raw base, no compensation yet.
+  if (guest_base.is_constant) {
+    e.mov(e.w0, static_cast<uint32_t>(guest_base.constant()));
+  } else {
+    e.mov(e.w0, WReg(guest_base.reg().getIdx()));
+  }
+  // Add the raw offset.
+  if (offset.is_constant) {
+    e.mov(e.w17,
+          static_cast<uint64_t>(static_cast<uint32_t>(offset.constant())));
+    e.add(e.w0, e.w0, e.w17);
+  } else {
+    e.add(e.w0, e.w0, WReg(offset.reg().getIdx()));
+  }
+  // Compensate exactly once, on the true combined address.
+  if (xe::memory::allocation_granularity() > 0x1000) {
+    e.mov(e.w17, 0xE0000000u);
+    e.cmp(e.w0, e.w17);
+    auto& skip = e.NewCachedLabel();
+    e.b(LO, skip);
+    e.add(e.w0, e.w0, 1, 12);  // add 0x1000 via LSL #12
+    e.L(skip);
+  }
+  return e.x0;
+}
+
 // Flush denormal float32 lanes to zero in a NEON register (in-place).
 // A float32 is denormal when 0 < abs(val) < 0x00800000.
 // vreg must not equal sa or sb.

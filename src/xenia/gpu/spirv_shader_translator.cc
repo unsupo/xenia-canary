@@ -2668,9 +2668,10 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
     // body (all skinning done). Keyed by the raw vertex index (no aliasing
     // within one draw), gated by push.index_count == XE_DGATHER_IDXCOUNT so a
     // single draw among the many that share the shader can be inspected.
-    // Region: kDivergentGatherDiagPreBaseVec4, stride 20; slots [5+k] = r(3+k)
-    // for k in 0..8 (r3..r11: blended matrix rows r3/r4/r5, position vector r6,
-    // fetched TBN r7, and the rest).
+    // Region: kDivergentGatherDiagPreBaseVec4, stride 20; slots [15+k] = r(3+k)
+    // for k in 0..3 (r3/r4/r8 = final blended matrix rows, r6 = position
+    // vector). Slots 0..14 are used by the per-read probe in
+    // LoadDivergentFloatConstant - keep these disjoint from it.
     const char* idxc_env = std::getenv("XE_DGATHER_IDXCOUNT");
     if (buffer_divergent_gather_ != spv::NoResult &&
         DivergentGatherDiagEnabled() && input_vertex_index_ != spv::NoResult &&
@@ -2700,9 +2701,10 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
           builder_->createBinOp(
               spv::OpIMul, type_uint_, key,
               builder_->makeUintConstant(kDivergentGatherDiagStrideVec4)));
-      for (int k = 0; k < 9; ++k) {
+      static const int kRegs[4] = {3, 4, 8, 6};
+      for (int k = 0; k < 4; ++k) {
         id_vector_temp_util_.clear();
-        id_vector_temp_util_.push_back(builder_->makeIntConstant(3 + k));
+        id_vector_temp_util_.push_back(builder_->makeIntConstant(kRegs[k]));
         spv::Id rv = builder_->createLoad(
             builder_->createAccessChain(spv::StorageClassFunction,
                                         var_main_registers_,
@@ -2713,7 +2715,7 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
         id_vector_temp_util_.push_back(builder_->createUnaryOp(
             spv::OpBitcast, type_int_,
             builder_->createBinOp(spv::OpIAdd, type_uint_, base,
-                                  builder_->makeUintConstant(5 + k))));
+                                  builder_->makeUintConstant(15 + k))));
         builder_->createStore(
             rv, builder_->createAccessChain(spv::StorageClassStorageBuffer,
                                             buffer_divergent_gather_,
@@ -4150,7 +4152,102 @@ spv::Id SpirvShaderTranslator::LoadDivergentFloatConstant(
   if (slot < kDivergentGatherMaxReads) {
     builder_->createStore(value, gather_pointer);
   }
-  dgdiag_probe(a0, value, kDivergentGatherDiagPreBaseVec4);
+  // NOTE: the old dgdiag_probe(a0, value, kDivergentGatherDiagPreBaseVec4) call
+  // that used to be here wrote to the SAME region/offsets (slots 0-3) as the
+  // draw-isolated per-read probe below, aliased across every AF3E draw in the
+  // frame (not just the one selected by XE_DGATHER_IDXCOUNT) - it corrupted
+  // slots 0-3 with stray data from unrelated draws. Disabled in favor of the
+  // per-read probe, which is draw-isolated end to end.
+
+  // XE_DGATHER_DIAG + XE_DGATHER_IDXCOUNT: draw-isolated per-read trace. Slots
+  // [0..11] = {a0, val.x, val.y, val.z} for each of the 12 c[a0] reads, in
+  // program order (3 consecutive reads per bone: static_offset 18,17,16).
+  // Slot 12 = r3 (raw vfetched weight bytes/255, still unmolested at the first
+  // read). Slot 13 = r8 (normalized weights). Slot 14 = r9 (bone index * 3,
+  // the maxas source). Region: kDivergentGatherDiagPreBaseVec4, stride 20.
+  if (buffer_divergent_gather_ != spv::NoResult && DivergentGatherDiagEnabled() &&
+      input_vertex_index_ != spv::NoResult && var_main_registers_ != spv::NoResult &&
+      push_constants_divergent_gather_ != spv::NoResult && slot < 12 &&
+      std::getenv("XE_DGATHER_IDXCOUNT")) {
+    spv::Id want = builder_->makeUintConstant(
+        uint32_t(atoi(std::getenv("XE_DGATHER_IDXCOUNT"))));
+    id_vector_temp_util_.clear();
+    id_vector_temp_util_.push_back(builder_->makeIntConstant(1));
+    spv::Id idx_count = builder_->createLoad(
+        builder_->createAccessChain(spv::StorageClassPushConstant,
+                                    push_constants_divergent_gather_,
+                                    id_vector_temp_util_),
+        spv::NoPrecision);
+    spv::Id match =
+        builder_->createBinOp(spv::OpIEqual, type_bool_, idx_count, want);
+    spv::Id raw = builder_->createLoad(input_vertex_index_, spv::NoPrecision);
+    spv::Id key = builder_->createBinOp(
+        spv::OpBitwiseAnd, type_uint_,
+        builder_->createUnaryOp(spv::OpBitcast, type_uint_, raw),
+        builder_->makeUintConstant(0xFFFF));
+    key = builder_->createTriOp(spv::OpSelect, type_uint_, match, key,
+                                const_uint_0_);
+    spv::Id base = builder_->createBinOp(
+        spv::OpIAdd, type_uint_,
+        builder_->makeUintConstant(kDivergentGatherDiagPreBaseVec4),
+        builder_->createBinOp(spv::OpIMul, type_uint_, key,
+                              builder_->makeUintConstant(
+                                  kDivergentGatherDiagStrideVec4)));
+    auto put_dg2 = [&](uint32_t off, spv::Id v) {
+      id_vector_temp_util_.clear();
+      id_vector_temp_util_.push_back(const_int_0_);
+      id_vector_temp_util_.push_back(builder_->createUnaryOp(
+          spv::OpBitcast, type_int_,
+          builder_->createBinOp(spv::OpIAdd, type_uint_, base,
+                                builder_->makeUintConstant(off))));
+      builder_->createStore(
+          v, builder_->createAccessChain(spv::StorageClassStorageBuffer,
+                                         buffer_divergent_gather_,
+                                         id_vector_temp_util_));
+    };
+    put_dg2(slot, builder_->createCompositeConstruct(
+                      type_float4_,
+                      {builder_->createUnaryOp(spv::OpConvertSToF, type_float_,
+                                               a0),
+                       builder_->createCompositeExtract(value, type_float_, 0),
+                       builder_->createCompositeExtract(value, type_float_, 1),
+                       builder_->createCompositeExtract(value, type_float_,
+                                                        2)}));
+    if (slot == 0) {
+      auto reg2 = [&](int n) {
+        id_vector_temp_util_.clear();
+        id_vector_temp_util_.push_back(builder_->makeIntConstant(n));
+        return builder_->createLoad(
+            builder_->createAccessChain(spv::StorageClassFunction,
+                                        var_main_registers_,
+                                        id_vector_temp_util_),
+            spv::NoPrecision);
+      };
+      put_dg2(12, reg2(3));
+      put_dg2(13, reg2(8));
+      put_dg2(14, reg2(9));
+    }
+    if (slot == 9) {
+      // First read of the 4th (last) bone group (instr 30's c[16+a0] operand):
+      // r3/r4/r5 still hold the post-bone-3, pre-instr-30 accumulator state -
+      // nothing has stored to them yet for this instruction. Snapshot them to
+      // check whether the dual-swizzle mad (mad rX, w, c[.+a0].zyxw, rY.zyxw)
+      // that folds bone 4 in is what corrupts the blend, independent of its
+      // weight (bone 4 is frequently weight 0.0).
+      auto reg3 = [&](int n) {
+        id_vector_temp_util_.clear();
+        id_vector_temp_util_.push_back(builder_->makeIntConstant(n));
+        return builder_->createLoad(
+            builder_->createAccessChain(spv::StorageClassFunction,
+                                        var_main_registers_,
+                                        id_vector_temp_util_),
+            spv::NoPrecision);
+      };
+      put_dg2(19, reg3(3));
+      put_dg2(20, reg3(4));
+      put_dg2(21, reg3(5));
+    }
+  }
   return value;
 }
 

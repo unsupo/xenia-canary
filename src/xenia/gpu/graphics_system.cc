@@ -9,6 +9,8 @@
 
 #include "xenia/gpu/graphics_system.h"
 
+#include <chrono>
+
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
@@ -204,8 +206,19 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
   frame_limiter_worker_thread_->set_can_debugger_suspend(true);
   frame_limiter_worker_thread_->set_name("GPU Frame limiter");
   frame_limiter_worker_thread_->Create();
+#if XE_PLATFORM_MAC
+  // macOS maps ThreadPriority::kLowest to nice +19, which the scheduler will
+  // starve almost completely whenever another thread is busy-spinning at
+  // 100% - and guest GPU-fence waits are exactly that. This thread delivers
+  // the vblank interrupts the guest's frame pacing depends on, so starving
+  // it livelocks the title (the spinning waiter monopolises the CPU and the
+  // signaller never runs). Keep it at normal priority here.
+  frame_limiter_worker_thread_->thread()->set_priority(
+      threading::ThreadPriority::kNormal);
+#else
   frame_limiter_worker_thread_->thread()->set_priority(
       threading::ThreadPriority::kLowest);
+#endif
   if (cvars::trace_gpu_stream) {
     BeginTracing();
   }
@@ -339,7 +352,10 @@ void GraphicsSystem::SetInterruptCallback(uint32_t callback,
                                           uint32_t user_data) {
   interrupt_callback_ = callback;
   interrupt_callback_data_ = user_data;
-  XELOGGPU("SetInterruptCallback({:08X}, {:08X})", callback, user_data);
+  // The interrupt user_data is the guest's D3D "swap sync" object. Its
+  // fields drive the frame-pacing fence: +0x2a90 -> pointer to the value
+  // the guest polls, +0x2a9c -> the value it wants that pointer to reach.
+  swap_sync_object_ = user_data;
 }
 
 void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
@@ -347,11 +363,133 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
                                         interrupt_callback_data_, source, cpu);
 }
 
+void GraphicsSystem::SetGpuIdentifierAddress(uint32_t guest_address) {
+  gpu_identifier_address_.store(guest_address, std::memory_order_relaxed);
+  PublishGpuIdentifier();
+}
+
+void GraphicsSystem::SetGpuIdentifierValue(uint32_t value) {
+  // Monotonic - never let it go backwards (the CP can process an older
+  // write_ptr snapshot after a newer one on a wraparound edge).
+  uint32_t prev = gpu_identifier_value_.load(std::memory_order_relaxed);
+  while (int32_t(value - prev) > 0 &&
+         !gpu_identifier_value_.compare_exchange_weak(
+             prev, value, std::memory_order_relaxed)) {
+  }
+  PublishGpuIdentifier();
+}
+
+// Read/write a guest u32 (big-endian) applying the same +0x1000 fixup the
+// A64 JIT does for >= 0xE0000000 addresses on 16 KB-page hosts (see
+// a64_seq_util.h ComputeMemoryAddress) so we hit the page the guest reads.
+static inline uint8_t* GuestU32Host(uint8_t* base, uint32_t guest_addr) {
+  if (guest_addr >= 0xE0000000 && xe::memory::allocation_granularity() > 0x1000) {
+    guest_addr += 0x1000;
+  }
+  return base + guest_addr;
+}
+
+void GraphicsSystem::PublishGpuIdentifier() {
+  uint8_t* base = memory_->virtual_membase();
+  // Resolve the frame-pacing fence straight from the guest's own sync object:
+  // write the value it's waiting FOR (its target) into the location it polls.
+  // We have no real GPU timeline, so the pacing fence is a no-op - the guest
+  // stays gated by actually getting scheduled and by the CP draining the ring.
+  uint32_t addr = gpu_identifier_address_.load(std::memory_order_relaxed);
+  if (!addr) {
+    return;
+  }
+  // The guest passes an 0xE0000000-window (or physical) address; both resolve
+  // through TranslateVirtual for the guest's own view. Direct3D spins reading
+  // this expecting the GPU's completion counter, which for us is the
+  // swap/interrupt counter the command processor maintains. The guest polls a
+  // couple of words around the address it registered, so cover the small
+  // record.
+  // value is the count of guest submissions the CP has fully drained. The
+  // guest's fence wants completed >= submitted - small_allowance, so this
+  // exact count resolves it. Do NOT add a lead - overshooting the guest's
+  // submitted count wraps its unsigned compare and spins just the same.
+  uint32_t value = gpu_identifier_value_.load(std::memory_order_relaxed);
+  // Match the JIT's guest->host address computation exactly (see
+  // a64_seq_util.h ComputeMemoryAddress): on hosts whose allocation
+  // granularity exceeds 4 KB (macOS ARM64), guest addresses at/above
+  // 0xE0000000 are shifted +0x1000. TranslateVirtual's heap-offset path does
+  // NOT reproduce this for the 0xE0000000 window, so the guest's read of
+  // this address and a naive write would land on different host pages.
+  // Write only the identifier word the guest registered. Do NOT spray
+  // neighbouring words - the guest keeps other GPU-status fields (tagged
+  // sequences) right next to it.
+  *reinterpret_cast<uint32_t*>(GuestU32Host(base, addr)) =
+      __builtin_bswap32(value);
+
+  // Direct3D's frame-pacing fence.
+  //
+  // Fable II (and other D3D titles) register a graphics-interrupt sync object
+  // via VdSetGraphicsInterruptCallback whose user_data we stashed in
+  // swap_sync_object_. Its layout:
+  //   +0x2a90  poll pointer  (an 0xE0000000-window guest address)
+  //   +0x2a9c  target        (the fence value the title is spinning FOR)
+  // The title's spin loop (guest 0x82242628 / 0x82B9D380) exits when the word
+  // at *poll_ptr lands in [target - maxLag, target] (observed maxLag: 2 for the
+  // outer driver, 4 for the inner dispatcher). The word is normally advanced by
+  // the title's own EVENT_WRITE_SHD packets - but once the CP has drained the
+  // ring the title won't submit the work that would post the last increment(s)
+  // until the fence passes: a circular wait with no async GPU to break it.
+  //
+  // Snap the poll word up to the target once it has fallen clearly behind
+  // (lag > 2, i.e. past the tightest observed maxLag). We have already drained
+  // every packet the CP was handed, so from the guest's point of view the GPU
+  // *is* caught up; the residual lag is the title reserving fence slots ahead
+  // of the EVENT_WRITE_SHD packets it will only emit once this fence clears.
+  // During normal streaming EVENT_WRITE_SHD keeps the word within a couple of
+  // the target, so this never fights the title's own writes. Writing exactly
+  // target (never past it) keeps the guest's unsigned target-relative compare
+  // from wrapping.
+  uint32_t sync = swap_sync_object_.load(std::memory_order_relaxed);
+  if (sync) {
+    auto sync_u32 = [&](uint32_t off) {
+      return __builtin_bswap32(
+          *reinterpret_cast<uint32_t*>(base + sync + off));
+    };
+    uint32_t poll_ptr = sync_u32(0x2a90);
+    uint32_t target = sync_u32(0x2a9c);
+    if (poll_ptr >= 0xE0000000) {
+      uint8_t* host = GuestU32Host(base, poll_ptr);
+      uint32_t live = __builtin_bswap32(*reinterpret_cast<uint32_t*>(host));
+      if (static_cast<int32_t>(target - live) > 2) {
+        *reinterpret_cast<uint32_t*>(host) = __builtin_bswap32(target);
+      }
+
+      // poll_ptr[+4] is the second frame-pacing fence: the guest's D3D
+      // command-buffer allocator (guest 0x82206538 / 0x822065F0) spins here
+      // waiting for the "GPU consumed pointer" - normally advanced by the
+      // title's own EVENT_WRITE_SHD(addr=...+4) packets - to reach the region
+      // it wants to (re)allocate. Its low 2 bits are a wrap-generation tag;
+      // the allocator's exit test is purely `(gen - word) & 3 == 0`, where
+      // gen = *(sync + 0x3a48). Once the CP has drained the ring there is no
+      // pending GPU work, so from the guest's view the GPU *is* in the
+      // current generation - publish that by matching the tag. Gate on an
+      // actually-drained ring so we never signal "consumed" while the CP is
+      // still reading command memory the allocator is about to reuse.
+      if (command_processor_ && command_processor_->is_ring_idle()) {
+        uint8_t* host4 = GuestU32Host(base, poll_ptr + 4);
+        uint32_t word4 = __builtin_bswap32(*reinterpret_cast<uint32_t*>(host4));
+        uint32_t gen_tag = sync_u32(0x3a48) & 0x3;
+        if ((word4 & 0x3) != gen_tag) {
+          *reinterpret_cast<uint32_t*>(host4) =
+              __builtin_bswap32((word4 & ~0x3u) | gen_tag);
+        }
+      }
+    }
+  }
+}
+
 void GraphicsSystem::MarkVblank() {
   SCOPE_profile_cpu_f("gpu");
 
   // Increment vblank counter (so the game sees us making progress).
   command_processor_->increment_counter();
+  PublishGpuIdentifier();
 
   // TODO(benvanik): we shouldn't need to do the dispatch here, but there's
   //     something wrong and the CP will block waiting for code that

@@ -100,6 +100,17 @@ uint32_t DrawExtentEstimator::EstimateVertexMaxY(const Shader& vertex_shader) {
     return xenos::kTexture2DCubeMaxWidthHeight;
   }
 
+  // Running the software vertex-shader interpreter once per index gets
+  // pathologically expensive for large unclipped draws (seen stalling the GPU
+  // command processor for many seconds on Fable II / macos-arm64). Unclipped
+  // draws that actually need this are near-always small full-screen prims;
+  // above a sane cap, fall back to the conservative full-height estimate (the
+  // caller std::min's it against GetRenderTargetHeight anyway).
+  constexpr uint32_t kMaxInterpretedVertices = 4096;
+  if (uint32_t(vgt_draw_initiator.num_indices) > kMaxInterpretedVertices) {
+    return xenos::kTexture2DCubeMaxWidthHeight;
+  }
+
   auto vgt_dma_size = regs.Get<reg::VGT_DMA_SIZE>();
   union {
     const void* index_buffer;

@@ -344,9 +344,19 @@ void ParsedVertexFetchInstruction::Disassemble(StringBuffer* out) const {
     out->AppendFormat(", Offset={}", attributes.offset);
   }
   if (attributes.data_format != xenos::VertexFormat::kUndefined) {
-    out->AppendFormat(
-        ", DataFormat={}",
-        kVertexFetchDataFormats[static_cast<int>(attributes.data_format)].name);
+    // data_format comes straight from the guest ucode's raw bitfield with no
+    // validation, and kVertexFetchDataFormats only has entries for the
+    // documented VertexFormat enumerators - every other slot is a null-named
+    // {0}. fmt (unlike strlen-based formatting) throws format_error rather
+    // than crashing outright when handed a null char*, but that exception
+    // still went uncaught here and took the whole process down. Some titles
+    // (e.g. Fable II) hit one of these reserved/undocumented format values,
+    // so fall back to a placeholder instead of dereferencing the hole.
+    const char* format_name =
+        kVertexFetchDataFormats[static_cast<int>(attributes.data_format)]
+            .name;
+    out->AppendFormat(", DataFormat={}",
+                       format_name ? format_name : "<unknown_fmt>");
   }
   if (!is_mini_fetch && attributes.stride) {
     out->AppendFormat(", Stride={}", attributes.stride);

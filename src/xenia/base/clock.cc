@@ -9,9 +9,12 @@
 
 #include "xenia/base/clock.h"
 
+#include <atomic>
+#include <chrono>
 #include <mutex>
 
 #include "xenia/base/assert.h"
+#include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/mutex.h"
 

@@ -231,6 +231,11 @@ dword_result_t XNetLogonGetMachineID_entry(lpqword_t machine_id_ptr) {
 }
 DECLARE_XAM_EXPORT1(XNetLogonGetMachineID, kNetworking, kStub);
 
+dword_result_t XNetLogonGetTitleID_entry() {
+  return kernel_state()->title_id();
+}
+DECLARE_XAM_EXPORT1(XNetLogonGetTitleID, kNetworking, kStub);
+
 dword_result_t NetDll_XNetGetOpt_entry(dword_t one, dword_t option_id,
                                        lpvoid_t buffer_ptr,
                                        lpdword_t buffer_size) {

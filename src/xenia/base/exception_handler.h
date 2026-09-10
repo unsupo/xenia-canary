@@ -60,6 +60,18 @@ constexpr uint32_t kArm64LoadStorePairAnyFMask = UINT32_C(0x3A000000);
 constexpr uint32_t kArm64LoadStorePairAnyFixed = UINT32_C(0x28000000);
 constexpr uint32_t kArm64LoadStorePairLoadBit = UINT32_C(1) << 22;
 
+// The "load/store exclusive" encoding class (bits[29:24] == 0b001000) -
+// LDXR/STXR/LDAXR/STLXR/LDAR/STLR/CAS(AL) and friends. This is a distinct
+// top-level class from the "load/store register" class that
+// kArm64LoadStoreMask/Arm64LoadStoreOp decode below: at that mask's
+// granularity some of its opcodes alias exactly with values in
+// Arm64LoadStoreOp (e.g. a 32-bit STLR's masked bits equal kLDRSW_x's), so
+// this class must be recognized and handled before falling through to that
+// switch, not added as more cases in it.
+constexpr uint32_t kArm64LoadStoreExclusiveFMask = UINT32_C(0x3F000000);
+constexpr uint32_t kArm64LoadStoreExclusiveFixed = UINT32_C(0x08000000);
+constexpr uint32_t kArm64LoadStoreExclusiveLoadBit = UINT32_C(1) << 22;
+
 constexpr uint32_t kArm64LoadStoreMask = UINT32_C(0xC4C00000);
 enum class Arm64LoadStoreOp : uint32_t {
   kSTRB_w = UINT32_C(0x00000000),

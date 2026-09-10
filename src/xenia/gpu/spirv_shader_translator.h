@@ -385,7 +385,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // vertex index (& 0xFFFF): [0]={a0, value.x, value.w, raw}, [1]=r0 (raw
   // weights), [2]=r1 (normalized weights), [3]=r6 (bone idx * stride) for the
   // pre-pass / r5 (a blend accumulator) for the vertex shader.
-  static constexpr uint32_t kDivergentGatherDiagStrideVec4 = 20;
+  static constexpr uint32_t kDivergentGatherDiagStrideVec4 = 24;
   static constexpr uint32_t kDivergentGatherDiagPreBaseVec4 =
       kDivergentGatherResultsBaseVec4 +
       kDivergentGatherMaxVertices * kDivergentGatherMaxReads;
@@ -413,6 +413,17 @@ class SpirvShaderTranslator : public ShaderTranslator {
   static constexpr uint32_t kDivergentGatherDiagVsGridEndVec4 =
       kDivergentGatherDiagVsGridBaseVec4 +
       kDivergentGatherDiagPsWidth * kDivergentGatherDiagPsHeight;
+  // XE_DGATHER_DIAG + XE_DGATHER_IDXCOUNT: a frozen copy of gather[0..255] (the
+  // float-constant UBO snapshot) taken only for the matching draw, so later
+  // draws sharing the shader don't overwrite it before IssueSwap reads it back
+  // - unlike gather[0..255] itself, which every eligible draw in the frame
+  // recopies. Diff against "_dgdiag_regfile.raw" (live RegisterFile ground
+  // truth for the same draw) to check the constant-buffer upload path.
+  static constexpr uint32_t kDivergentGatherDiagConstsFrozenBaseVec4 =
+      kDivergentGatherDiagVsGridEndVec4;
+  static constexpr uint32_t kDivergentGatherDiagConstsFrozenEndVec4 =
+      kDivergentGatherDiagConstsFrozenBaseVec4 +
+      kDivergentGatherResultsBaseVec4;
   // Pre-pass push constant sentinel: the draw is non-indexed, so
   // gl_GlobalInvocationID.x is the raw vertex index directly.
   static constexpr uint32_t kDivergentGatherSequentialIndices = 0xFFFFFFFFu;

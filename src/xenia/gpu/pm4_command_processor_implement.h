@@ -24,11 +24,16 @@ void COMMAND_PROCESSOR::ExecuteIndirectBuffer(uint32_t ptr,
         COMMAND_PROCESSOR::GetCurrentRingReadCount());
     do {
       if (COMMAND_PROCESSOR::ExecutePacket()) {
+        // A downstream WAIT_REG_MEM gave up on a CPU<->GPU standoff - stop
+        // draining this IB and let it propagate to ExecutePrimaryBuffer.
+        if (wrm_deadlock_abort_) {
+          break;
+        }
         continue;
       } else {
-        // Return up a level if we encounter a bad packet.
-        XELOGE("**** INDIRECT RINGBUFFER: Failed to execute packet.");
-        assert_always();
+        // Return up a level if we encounter a bad packet. macos-arm64 Fable II
+        // bring-up: no assert_always() (SIGTRAPs in this NDEBUG build) - stale
+        // IB content lands here routinely; just unwind.
         break;
       }
     } while (reader_.read_count());
@@ -315,9 +320,12 @@ bool COMMAND_PROCESSOR::ExecutePacket() {
 XE_NOINLINE
 XE_COLD
 bool COMMAND_PROCESSOR::ExecutePacketType0_CountOverflow(uint32_t count) {
-  XELOGE("ExecutePacketType0 overflow (read count {:08X}, packet count {:08X})",
-         COMMAND_PROCESSOR::GetCurrentRingReadCount(),
-         count * sizeof(uint32_t));
+  static std::atomic<uint32_t> warn{0};
+  if ((warn++ & 0x3FF) == 0) {
+    XELOGE(
+        "ExecutePacketType0 overflow (read count {:08X}, packet count {:08X})",
+        COMMAND_PROCESSOR::GetCurrentRingReadCount(), count * sizeof(uint32_t));
+  }
   return false;
 }
 /*
@@ -334,10 +342,25 @@ bool COMMAND_PROCESSOR::ExecutePacketType0(uint32_t packet) XE_RESTRICT {
 
   if (COMMAND_PROCESSOR::GetCurrentRingReadCount() >=
       count * sizeof(uint32_t)) {
-    trace_writer_.WritePacketStart(uint32_t(reader_.read_ptr() - 4), 1 + count);
-
     uint32_t base_index = (packet & 0x7FFF);
     uint32_t write_one_reg = (packet >> 15) & 0x1;
+
+    // macos-arm64 Fable II bring-up: a Type0 whose base register is past the
+    // end of the register file is stale-IB garbage (seen: base 0x7100).
+    // Executing it is hundreds of rejected out-of-bounds WriteRegister calls
+    // per frame - a real slice of the lag. Unwind to the caller instead.
+    if (base_index >= RegisterFile::kRegisterCount) {
+      static std::atomic<uint32_t> warn{0};
+      if ((warn++ & 0x3FF) == 0) {
+        XELOGW(
+            "PM4 Type0: base register {:X} past the register file - stale IB "
+            "content, unwinding.",
+            base_index);
+      }
+      return false;
+    }
+
+    trace_writer_.WritePacketStart(uint32_t(reader_.read_ptr() - 4), 1 + count);
 
     if (!write_one_reg) {
       COMMAND_PROCESSOR::WriteRegisterRangeFromRing(&reader_, base_index,
@@ -383,9 +406,12 @@ uint32_t COMMAND_PROCESSOR::GetCurrentRingReadCount() {
 XE_NOINLINE
 XE_COLD
 bool COMMAND_PROCESSOR::ExecutePacketType3_CountOverflow(uint32_t count) {
-  XELOGE("ExecutePacketType3 overflow (read count {:08X}, packet count {:08X})",
-         COMMAND_PROCESSOR::GetCurrentRingReadCount(),
-         count * sizeof(uint32_t));
+  static std::atomic<uint32_t> warn{0};
+  if ((warn++ & 0x3FF) == 0) {
+    XELOGE(
+        "ExecutePacketType3 overflow (read count {:08X}, packet count {:08X})",
+        COMMAND_PROCESSOR::GetCurrentRingReadCount(), count * sizeof(uint32_t));
+  }
   return false;
 }
 XE_NOINLINE
@@ -602,9 +628,15 @@ XE_NOINLINE
 XE_COLD
 bool COMMAND_PROCESSOR::HitUnimplementedOpcode(uint32_t opcode,
                                                uint32_t count) XE_RESTRICT {
-  XELOGGPU("Unimplemented GPU OPCODE: 0x{:02X}\t\tCOUNT: {}\n", opcode, count);
-  assert_always();
-  reader_.AdvanceRead(count * sizeof(uint32_t));
+  // macos-arm64 Fable II bring-up: PM4 desyncs (stale IB content dispatched
+  // before the D3D producer filled it) reach this path on garbage opcodes.
+  // Don't assert_always() (it SIGTRAPs even in this NDEBUG build) and don't
+  // AdvanceRead a bogus count - just unwind to the caller, which recovers at
+  // the ring head.
+  static std::atomic<uint32_t> warn{0};
+  if ((warn++ & 0xFF) == 0) {
+    XELOGGPU("Unimplemented GPU OPCODE: 0x{:02X} COUNT: {}", opcode, count);
+  }
   trace_writer_.WritePacketEnd();
   return false;
 }
@@ -674,7 +706,33 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_INDIRECT_BUFFER(
   uint32_t list_length = reader_.ReadAndSwap<uint32_t>();
   assert_zero(list_length & ~0xFFFFF);
   list_length &= 0xFFFFF;
-  COMMAND_PROCESSOR::ExecuteIndirectBuffer(GpuToCpu(list_ptr), list_length);
+
+  // macos-arm64 Fable II bring-up: the D3D producer sometimes advances the
+  // ring write pointer past an IB-dispatch packet before it has finished
+  // filling that IB, pointing us at stale/uninitialized command memory. Skip a
+  // dispatch whose length is wild or whose first word isn't a plausible PM4
+  // header rather than parsing megabytes of garbage (and wedging on a bogus
+  // WAIT_REG_MEM buried in it).
+  const uint32_t cpu_ptr = GpuToCpu(list_ptr);
+  bool plausible = list_length != 0 && list_length <= 0x20000 &&
+                   cpu_ptr >= 0x1000 && cpu_ptr < 0x20000000;
+  if (plausible) {
+    uint32_t w0 =
+        xe::load_and_swap<uint32_t>(memory_->TranslatePhysical(cpu_ptr));
+    uint32_t t0 = w0 >> 30;
+    plausible = (t0 == 0 || t0 == 3) && w0 != 0xFFFFFFFF;
+  }
+  if (!plausible) {
+    static std::atomic<uint32_t> warn{0};
+    if ((warn++ & 0x7F) == 0) {
+      XELOGW(
+          "PM4 INDIRECT_BUFFER: skipping an implausible dispatch (ptr {:08X}, "
+          "length {:05X}) - stale ring content.",
+          cpu_ptr, list_length);
+    }
+    return true;
+  }
+  COMMAND_PROCESSOR::ExecuteIndirectBuffer(cpu_ptr, list_length);
   return true;
 }
 
@@ -709,12 +767,82 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
 
   bool is_memory = (wait_info & 0x10) != 0;
   assert_true(is_memory || poll_reg_addr < RegisterFile::kRegisterCount);
+
+  // macos-arm64 Fable II bring-up: an IB dispatched before its D3D producer
+  // filled it is parsed as garbage, and the garbage words routinely decode to
+  // a WAIT_REG_MEM whose poll target is unsatisfiable - a physical address far
+  // outside guest RAM, or mask==0 against a non-zero ref with an equality
+  // function (value & 0 can only ever equal 0). Spinning 4s on each of these
+  // before the wall-clock breaker trips wedges the CP for minutes. Detect the
+  // impossible poll up front and bail straight to the ring head.
+  if (is_memory) {
+    uint32_t phys = poll_reg_addr & ~uint32_t(0x3);
+    // A real Fable II memory WAIT_REG_MEM polls the GPU-adjacent region
+    // (0x1Fxxxxxx: system command buffer / ring / fence page / the 0x1FC800xx
+    // mailbox) - all of which xenia keeps mapped. Garbage decoded from a stale
+    // IB routinely produces a poll address elsewhere: past the 512 MB map, in
+    // the null guard, or - worse - a plausible-looking RAM address whose
+    // physical page was never committed, so the very first `value = value_ref`
+    // read below SIGSEGVs. Anything outside the always-mapped GPU window, or an
+    // unsatisfiable compare (mask==0 vs a non-zero ref under equality), is stale
+    // content: bail to the ring head instead of reading it.
+    bool addr_ok = phys >= 0x1F000000u && phys < 0x20000000u;
+    bool satisfiable =
+        addr_ok && (mask != 0 || MatchValueAndRef(0, ref, wait_info));
+    if (!satisfiable) {
+      static std::atomic<uint32_t> warn{0};
+      if ((warn++ & 0x3F) == 0) {
+        XELOGW(
+            "PM4 WAIT_REG_MEM: unsatisfiable poll (addr={:08X} ref={:08X} "
+            "mask={:08X} wait_info={:08X}) - stale IB content, abandoning the "
+            "pending ring.",
+            poll_reg_addr, ref, mask, wait_info);
+      }
+      wrm_deadlock_abort_ = true;
+      return false;
+    }
+  }
+
   const volatile uint32_t& value_ref =
       is_memory ? *reinterpret_cast<uint32_t*>(memory_->TranslatePhysical(
                       poll_reg_addr & ~uint32_t(0x3)))
                 : register_file_->values[poll_reg_addr];
 
   bool matched = false;
+
+  // macos-arm64: an unsatisfied memory WAIT_REG_MEM means the worker has
+  // consumed every packet it can until the guest writes the polled value.
+  // Fable II's GPU-management thread treats "GPU parked here" as "GPU drained"
+  // for its flush/pump loop, and its frame-pacing fence only advances once
+  // that loop completes - so publish this state so the fence publisher can
+  // release it (see GraphicsSystem::PublishGpuIdentifier / is_ring_idle()).
+  uint32_t wrm_spins = 0;
+
+  // macos-arm64 (16 KB host pages): the guest reaches the CP<->CPU mailbox
+  // (guest phys 0x1FC800xx) through an 0xE0000000-window pointer, and the A64
+  // JIT shifts every >= 0xE0000000 access +0x1000 to clear the host guard page
+  // (a64_seq_util.h ComputeMemoryAddress / GraphicsSystem::GuestU32Host). A
+  // store the guest believes lands at phys P lands at P + 0x1000, so this poll
+  // of the unshifted P never observes it. Also read P + 0x1000. ref here is a
+  // specific non-zero token, so a coincidental alias match is not a concern.
+  const volatile uint32_t* value_ref_alias = nullptr;
+  // The CP<->CPU mailbox page. A poll here is the handshake that has no async
+  // GPU to complete it on this port (nothing - guest or PM4 - writes 0x1FC800xx;
+  // it reads xenia's ring poison 0x0BADF00D forever). See the synthesis path in
+  // the spin loop below.
+  bool poll_is_mailbox = false;
+  if (is_memory) {
+    uint32_t phys = poll_reg_addr & ~uint32_t(0x3);
+    if (phys >= 0x1FC80000 && phys < 0x1FC81000) {
+      value_ref_alias = reinterpret_cast<uint32_t*>(
+          memory_->TranslatePhysical(phys + 0x1000));
+      poll_is_mailbox = true;
+    }
+  }
+  const uint64_t wrm_entry_ms = uint64_t(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
 
   do {
     uint32_t value = value_ref;
@@ -730,28 +858,186 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
       }
     }
     matched = MatchValueAndRef(value & mask, ref, wait_info);
+    if (!matched && value_ref_alias) {
+      uint32_t av = xenos::GpuSwap(
+          *value_ref_alias, static_cast<xenos::Endian>(poll_reg_addr & 0x3));
+      if (MatchValueAndRef(av & mask, ref, wait_info)) {
+        if (wrm_spins > 100) {
+          XELOGW(
+              "PM4 WAIT_REG_MEM addr={:08X} ref={:08X}: matched via +0x1000 "
+              "JIT-shift alias after {} spins.",
+              poll_reg_addr, ref, wrm_spins);
+        }
+        matched = true;
+      }
+    }
 
     if (!matched) {
-      // Wait.
-      if (wait >= 0x100) {
-        PrepareForWait();
-        if (!cvars::vsync) {
-          // User wants it fast and dangerous.
-          // do nothing
-        } else {
-          xe::threading::Sleep(std::chrono::milliseconds(wait / 0x100));
-          ReturnFromWait();
-        }
+      wrm_spins++;
 
-        if (!worker_running_) {
-          // Short-circuited exit.
+      // Wait.
+      if (is_memory && !wait_reg_mem_parked_.load(std::memory_order_relaxed)) {
+        wait_reg_mem_parked_.store(true, std::memory_order_relaxed);
+        if (graphics_system_) {
+          graphics_system_->PublishGpuIdentifier();
+        }
+      }
+
+      // Execute pending host functions (e.g. CallInThread callbacks - the
+      // VdSwap IssueSwap dispatch) so the CP thread doesn't starve them while
+      // stalled here.
+      for (;;) {
+        std::function<void()> fn;
+        {
+          std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+          if (pending_fns_.empty()) {
+            break;
+          }
+          fn = std::move(pending_fns_.front());
+          pending_fns_.pop();
+        }
+        fn();
+      }
+
+      // macos-arm64 Fable II bring-up diagnostic: surface what this poll is
+      // actually stuck on the first time it spins past ~0.5s.
+      if (wrm_spins == 5000) {
+        XELOGW(
+            "PM4 WAIT_REG_MEM stalling: is_memory={} addr={:08X} ref={:08X} "
+            "mask={:08X} wait_info={:08X} wait={:08X} cur={:08X}",
+            is_memory, poll_reg_addr, ref, mask, wait_info, wait, value);
+      }
+
+      // macos-arm64 Fable II: CP<->CPU mailbox synthesis. The guest submits an
+      // IB containing this WAIT_REG_MEM on 0x1FC800xx and then parks its own
+      // producer/pump thread waiting for the GPU to drain - but the thing that
+      // would release this poll (a CP-microcode mailbox write on real hardware)
+      // is not emulated, and no guest store ever targets it either, so the two
+      // sides deadlock with no async GPU to break it. After ~1.2s stuck on a
+      // mailbox slot, write the value the guest told us to wait for straight
+      // into the slot and treat the wait as satisfied: downstream packets that
+      // consume the token then read a sane value (ref is a valid guest pointer
+      // or a small count), and the CP proceeds to the batch's CP_INTERRUPT,
+      // which fires the ISR that releases the guest's pump loop. This keeps the
+      // IB's draws (unlike the whole-ring abandon fallback below).
+      if (poll_is_mailbox) {
+        uint64_t now_ms = uint64_t(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        if (now_ms - wrm_entry_ms > 1200) {
+          uint32_t* slot = reinterpret_cast<uint32_t*>(
+              memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)));
+          *slot = xenos::GpuSwap(
+              ref, static_cast<xenos::Endian>(poll_reg_addr & 0x3));
+          static std::atomic<uint32_t> warn{0};
+          if ((warn++ & 0x1F) == 0) {
+            XELOGW(
+                "PM4 WAIT_REG_MEM addr={:08X}: CP<->CPU mailbox never written "
+                "({} ms) - synthesising ref={:08X} and continuing.",
+                poll_reg_addr, now_ms - wrm_entry_ms, ref);
+          }
+          matched = true;
+          if (wait_reg_mem_parked_.load(std::memory_order_relaxed)) {
+            wait_reg_mem_parked_.store(false, std::memory_order_relaxed);
+            if (graphics_system_) {
+              graphics_system_->PublishGpuIdentifier();
+            }
+          }
+          break;
+        }
+      }
+
+      // CPU<->GPU handshake deadlock breaker (wall-clock). This WAIT_REG_MEM
+      // often deadlocks by *churning* - re-entering, matching, stalling again -
+      // rather than one long spin, so a per-call spin count never trips. Track
+      // real forward progress (counter_ advancing) instead: if the worker has
+      // made none for ~2.5s while stuck here, abandon the pending ring to the
+      // write pointer. The guest re-submits, the CP reaches the batch's
+      // CP_INTERRUPT, and the source-1 ISR releases the guest's pump loop.
+      // Applies to register polls too (a register the guest's ISR would set,
+      // never reached because the ISR can't run while we hold the CP thread).
+      {
+        uint64_t now_ms = uint64_t(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        // "Progress" = the guest kicked off a meaningful batch of new ring
+        // work. A trickle of 1-2 submissions while otherwise wedged doesn't
+        // count (the guest producer re-issuing the same stuck batch). If real
+        // progress has stalled for ~2s while we're stuck here, stop waiting
+        // and run the rest of this buffer (its CP_INTERRUPT releases the
+        // guest's pump loop).
+        // Genuine forward progress = the guest kicked off a substantial batch
+        // of new ring work (not the 1-2/frame it re-issues while wedged, and
+        // not IssueSwap which keeps running from pending_fns_ during the
+        // stall).
+        uint32_t cnt = kickoff_count_.load(std::memory_order_relaxed);
+        if (wrm_last_progress_ms_ == 0 ||
+            cnt - wrm_last_progress_counter_ >= 32) {
+          wrm_last_progress_counter_ = cnt;
+          wrm_last_progress_ms_ = now_ms;
+        }
+        // Abandon if no real batch for ~4s while stuck here, or this single
+        // call has spun far too long.
+        if (wrm_spins > 40000 || now_ms - wrm_last_progress_ms_ > 4000) {
+          // Deadlocked. Do NOT proceed past the wait (downstream packets need
+          // the token the guest never wrote - dereferencing it crashes). Just
+          // abandon the pending ring to the write pointer so the CP idles;
+          // the guest re-submits and, if its producer un-wedges, recovers.
+          XELOGW(
+              "PM4 WAIT_REG_MEM addr={:08X} ref={:08X}: CPU<->GPU standoff "
+              "({} ms) - abandoning the pending ring.",
+              poll_reg_addr, ref, now_ms - wrm_last_progress_ms_);
+          wrm_last_progress_counter_ = cnt;
+          wrm_last_progress_ms_ = now_ms;
+          wrm_deadlock_abort_ = true;
+          wait_reg_mem_parked_.store(false, std::memory_order_relaxed);
+          if (graphics_system_) {
+            graphics_system_->PublishGpuIdentifier();
+          }
           return false;
         }
+      }
+
+      if (wait >= 0x100) {
+        PrepareForWait();
+        if (cvars::vsync) {
+          // WAIT_REG_MEM's `wait` is a poll interval, not a total timeout - the
+          // hardware re-checks each interval. Clamp it: stale IB content
+          // decodes `wait` to garbage (seen: 0xFFFFFFFF -> hours), which would
+          // wedge the CP in one Sleep past every deadlock check below.
+          uint32_t wait_ms = wait / 0x100;
+          xe::threading::Sleep(
+              std::chrono::milliseconds(wait_ms > 4 ? 4 : wait_ms));
+        } else {
+          xe::threading::Sleep(std::chrono::microseconds(100));
+        }
+        ReturnFromWait();
       } else {
+        // Sleep 100us per spin to yield CPU slice to guest producer threads
+        // (GameThread, DPC thread, allocator) so they can publish the polled token.
+        xe::threading::Sleep(std::chrono::microseconds(100));
+      }
+
+      if (!worker_running_) {
+        if (wait_reg_mem_parked_.load(std::memory_order_relaxed)) {
+          wait_reg_mem_parked_.store(false, std::memory_order_relaxed);
+          if (graphics_system_) {
+            graphics_system_->PublishGpuIdentifier();
+          }
+        }
+        return false;
       }
     }
   } while (!matched);
 
+  if (is_memory && wait_reg_mem_parked_.load(std::memory_order_relaxed)) {
+    wait_reg_mem_parked_.store(false, std::memory_order_relaxed);
+    if (graphics_system_) {
+      graphics_system_->PublishGpuIdentifier();
+    }
+  }
   return true;
 }
 XE_NOINLINE
@@ -1453,9 +1739,20 @@ uint32_t COMMAND_PROCESSOR::ExecutePrimaryBuffer(uint32_t read_index,
       GetCurrentRingReadCount());
   do {
     if (!COMMAND_PROCESSOR::ExecutePacket()) {
-      // This probably should be fatal - but we're going to continue anyways.
+      // macos-arm64 Fable II bring-up: no assert_always() (SIGTRAPs in this
+      // NDEBUG build). Stale ring content reaches here; just stop.
       XELOGE("**** PRIMARY RINGBUFFER: Failed to execute packet.");
-      assert_always();
+      break;
+    }
+    if (wrm_deadlock_abort_) {
+      // A WAIT_REG_MEM downstream gave up on a CPU<->GPU standoff. Drop the
+      // rest of the pending ring to the write pointer: the guest sees the GPU
+      // drained, unblocks its pump loop, and re-submits.
+      wrm_deadlock_abort_ = false;
+      XELOGW(
+          "PM4 primary buffer abandoned to the ring head after a WAIT_REG_MEM "
+          "deadlock.");
+      reader_.set_read_offset(write_index * sizeof(uint32_t));
       break;
     }
   } while (reader_.read_count());
@@ -1480,7 +1777,9 @@ void COMMAND_PROCESSOR::ExecutePacket(uint32_t ptr, uint32_t count) {
   do {
     if (!COMMAND_PROCESSOR::ExecutePacket()) {
       XELOGE("**** ExecutePacket: Failed to execute packet.");
-      assert_always();
+      break;
+    }
+    if (wrm_deadlock_abort_) {
       break;
     }
   } while (reader_.read_count());

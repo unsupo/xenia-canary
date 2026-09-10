@@ -12,6 +12,13 @@
 #include <atomic>
 #include <mutex>
 #include <thread>
+// TEMP DIAGNOSTIC (macos-arm64 investigation): see
+// XENIA_BASE_MUTEX_TEMP_ACQUIRE_DIAG below.
+#define XENIA_BASE_MUTEX_TEMP_ACQUIRE_DIAG 0
+#if XENIA_BASE_MUTEX_TEMP_ACQUIRE_DIAG
+#include <chrono>
+#include <cstdio>
+#endif
 #include "platform.h"
 #if XE_PLATFORM_WIN32
 #include "platform_win.h"
@@ -223,7 +230,42 @@ class global_critical_region {
 
   // Acquires a lock on the global critical section.
   static inline global_unique_lock_type Acquire() {
+#if XENIA_BASE_MUTEX_TEMP_ACQUIRE_DIAG
+    // TEMP DIAGNOSTIC (macos-arm64 investigation): global_mutex_type falls
+    // back to plain std::recursive_mutex on macOS (neither the Windows
+    // SRWLOCK-based nor the fast-Linux path apply here), and this lock is
+    // acquired extremely widely (memory heaps, kernel object table, GPU
+    // resource tracking...). Measure actual acquisition latency to check
+    // whether that fallback is what's behind an otherwise-unexplained ~19ms
+    // per iteration in a hot per-object loop.
+    auto start = std::chrono::steady_clock::now();
+    global_unique_lock_type lock(mutex());
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - start)
+                       .count();
+    static std::atomic<uint64_t> total_calls{0};
+    static std::atomic<uint64_t> total_micros{0};
+    static std::atomic<uint64_t> max_micros{0};
+    uint64_t calls = total_calls.fetch_add(1) + 1;
+    uint64_t micros = total_micros.fetch_add(uint64_t(elapsed)) + elapsed;
+    uint64_t prev_max = max_micros.load();
+    while (uint64_t(elapsed) > prev_max &&
+           !max_micros.compare_exchange_weak(prev_max, uint64_t(elapsed))) {
+    }
+    if ((calls & 0xFFFF) == 0) {
+      std::fprintf(stderr,
+                   "XE_GLOCKDIAG calls=%llu total_us=%llu avg_us=%.3f "
+                   "max_us=%llu this_us=%lld\n",
+                   (unsigned long long)calls, (unsigned long long)micros,
+                   double(micros) / double(calls),
+                   (unsigned long long)max_micros.load(),
+                   (long long)elapsed);
+      std::fflush(stderr);
+    }
+    return lock;
+#else
     return global_unique_lock_type(mutex());
+#endif
   }
 
   static inline void PrepareToAcquire() { swcache::PrefetchW(&mutex()); }

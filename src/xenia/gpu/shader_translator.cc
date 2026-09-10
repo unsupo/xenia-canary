@@ -1104,8 +1104,17 @@ void ParseTextureFetchInstruction(const TextureFetchInstruction& op,
       opcode_info = {"setGradientV", false, false, false, 3};
       break;
     default:
+      // assert_unhandled_case is compiled out in Release (NDEBUG) builds, so
+      // this is reachable there with opcode_info left uninitialized. Bailing
+      // out here used to leave `instr` (including opcode_name) unset, which
+      // every caller - including the disassembler, which unconditionally
+      // dereferences opcode_name - assumes is always populated. Fall through
+      // with a safe, inert placeholder instead of crashing on whatever
+      // fetch-opcode value the guest ucode actually contains (some titles hit
+      // reserved/unhandled FetchOpcode values here).
       assert_unhandled_case(fetch_opcode);
-      return;
+      opcode_info = {"<unknown_fetch>", false, false, false, 0};
+      break;
   }
 
   instr.opcode = op.opcode();

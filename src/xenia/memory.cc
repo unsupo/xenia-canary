@@ -1131,9 +1131,12 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size,
     uint32_t state = page_table_[page_number].state;
     if ((allocation_type == kMemoryAllocationReserve) && state) {
       // Already reserved.
-      XELOGE(
-          "BaseHeap::AllocFixed attempting to reserve an already reserved "
-          "range");
+      static std::atomic<uint32_t> warn{0};
+      if ((warn++ & 0x3FF) == 0) {
+        XELOGE(
+            "BaseHeap::AllocFixed attempting to reserve an already reserved "
+            "range");
+      }
       return false;
     }
     if ((allocation_type == kMemoryAllocationCommit) &&
@@ -1828,8 +1831,32 @@ bool PhysicalHeap::Alloc(uint32_t size, uint32_t alignment,
   top_down = true;
 
   // Adjust alignment size our page size differs from the parent.
-  size = xe::round_up(size, page_size_);
-  alignment = xe::round_up(alignment, page_size_);
+  //
+  // On hosts whose page size exceeds the guest's (e.g. macOS ARM64's 16 KB
+  // vs. the Xbox 360's 4 KB), also round up to the HOST's page size so two
+  // unrelated dynamic physical allocations never end up sharing one host
+  // page. GPU write-watch/cache-coherency tracking (PhysicalHeap::Protect,
+  // EnableAccessCallbacks) can only arm/trap memory at host page
+  // granularity: if an unrelated allocation (say, CPU scratch data written by
+  // a hot guest loop) shares a host page with a GPU-tracked resource, every
+  // write to either one faults and is treated as touching both, and
+  // re-arming the resource's watch re-protects the unrelated data too,
+  // forcing the unrelated writer through the fault/callback path it should
+  // never see. This wastes up to system_page_size_ - 1 bytes per allocation
+  // in exchange for isolating unrelated allocations at the host's real trap
+  // granularity - a no-op everywhere page_size_ already covers a full host
+  // page (Windows/Linux, where the two sizes match).
+  //
+  // The math establishing this is address-translation-safe even though this
+  // heap can carry a nonzero host_address_offset_ (only heap_base_ >=
+  // 0xE0000000 does): the parent heap's own offset is always zero, so its
+  // search finds parent_address % alloc_granularity == 0, and since
+  // parent_heap_start (below) equals host_address_offset_ exactly, the
+  // offset cancels out of (address + host_address_offset_) - see
+  // PhysicalHeap::GetPhysicalAddress.
+  uint32_t alloc_granularity = std::max(page_size_, system_page_size_);
+  size = xe::round_up(size, alloc_granularity);
+  alignment = xe::round_up(alignment, alloc_granularity);
 
   auto global_lock = global_critical_region_.Acquire();
 

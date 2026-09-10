@@ -154,14 +154,14 @@ constexpr VulkanTextureCache::HostFormatPair
         // VK_KHR_sampler_ycbcr_conversion and promoted to Vulkan 1.1) is
         // optional.
         {{kLoadShaderIndex32bpb, VK_FORMAT_G8B8G8R8_422_UNORM, true},
-         {kLoadShaderIndexGBGR8ToRGB8, VK_FORMAT_R8G8B8A8_SNORM},
+         {kLoadShaderIndexGBGR8ToRGB8, VK_FORMAT_R8G8B8A8_UNORM},
          xenos::XE_GPU_TEXTURE_SWIZZLE_RGBB},
         // k_Y1_Cr_Y0_Cb_REP
         // VK_FORMAT_B8G8R8G8_422_UNORM (added in
         // VK_KHR_sampler_ycbcr_conversion and promoted to Vulkan 1.1) is
         // optional.
         {{kLoadShaderIndex32bpb, VK_FORMAT_B8G8R8G8_422_UNORM, true},
-         {kLoadShaderIndexBGRG8ToRGB8, VK_FORMAT_R8G8B8A8_SNORM},
+         {kLoadShaderIndexBGRG8ToRGB8, VK_FORMAT_R8G8B8A8_UNORM},
          xenos::XE_GPU_TEXTURE_SWIZZLE_RGBB},
         // k_16_16_EDRAM
         // Not usable as a texture, also has -32...32 range.
@@ -971,22 +971,56 @@ uint64_t VulkanTextureCache::GetSubmissionToAwaitOnSamplerOverflow(
 
 VkImageView VulkanTextureCache::RequestSwapTexture(
     uint32_t& width_scaled_out, uint32_t& height_scaled_out,
-    xenos::TextureFormat& format_out) {
+    xenos::TextureFormat& format_out, uint32_t frontbuffer_ptr,
+    uint32_t frontbuffer_width, uint32_t frontbuffer_height) {
   const auto& regs = register_file();
   xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(0);
   TextureKey key;
   BindingInfoFromFetchConstant(fetch, key, nullptr);
+  uint32_t swizzle = fetch.swizzle;
+
   if (!key.is_valid || key.base_page == 0 ||
       key.dimension != xenos::DataDimension::k2DOrStacked) {
-    return nullptr;
+    if (!frontbuffer_ptr) {
+      return VK_NULL_HANDLE;
+    }
+    uint32_t fb_page = (frontbuffer_ptr & 0x1FFFFFFF) >> 12;
+    bool found = false;
+    for (const auto& pair : textures_) {
+      if (pair.first.base_page == fb_page) {
+        key = pair.first;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      key.MakeInvalid();
+      key.base_page = fb_page;
+      key.dimension = xenos::DataDimension::k2DOrStacked;
+      key.width_minus_1 = (frontbuffer_width ? frontbuffer_width : 1280) - 1;
+      key.height_minus_1 = (frontbuffer_height ? frontbuffer_height : 720) - 1;
+      key.tiled = 1;
+      key.packed_mips = 0;
+      key.mip_page = 0;
+      key.depth_or_array_size_minus_1 = 0;
+      key.pitch = 0;
+      key.mip_max_level = 0;
+      key.format = xenos::TextureFormat::k_8_8_8_8;
+      key.endianness = xenos::Endian::k8in32;
+      key.signed_separate = 0;
+      key.scaled_resolve = 0;
+      key.is_valid = 1;
+    }
+    swizzle = 0;
   }
+
   VulkanTexture* texture =
       static_cast<VulkanTexture*>(FindOrCreateTexture(key));
   if (!texture) {
     return VK_NULL_HANDLE;
   }
   VkImageView texture_view = texture->GetView(
-      false, GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(key)),
+      false, GuestToHostSwizzle(swizzle, GetHostFormatSwizzle(key)),
       false);
   if (texture_view == VK_NULL_HANDLE) {
     return VK_NULL_HANDLE;
@@ -2235,7 +2269,7 @@ bool VulkanTextureCache::Initialize() {
   assert_true(host_format_gbgr.format_unsigned.format ==
               VK_FORMAT_G8B8G8R8_422_UNORM_KHR);
   assert_true(host_format_gbgr.format_signed.format ==
-              VK_FORMAT_R8G8B8A8_SNORM);
+              VK_FORMAT_R8G8B8A8_UNORM);
   ifn.vkGetPhysicalDeviceFormatProperties(
       physical_device, VK_FORMAT_G8B8G8R8_422_UNORM_KHR, &format_properties);
   if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) !=
@@ -2243,6 +2277,9 @@ bool VulkanTextureCache::Initialize() {
     host_format_gbgr.format_unsigned.load_shader = kLoadShaderIndexGBGR8ToRGB8;
     host_format_gbgr.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
     host_format_gbgr.format_unsigned.block_compressed = false;
+    host_format_gbgr.format_signed.load_shader = kLoadShaderIndexGBGR8ToRGB8;
+    host_format_gbgr.format_signed.format = VK_FORMAT_R8G8B8A8_UNORM;
+    host_format_gbgr.format_signed.block_compressed = false;
     host_format_gbgr.unsigned_signed_compatible = true;
   }
   HostFormatPair& host_format_bgrg =
@@ -2250,7 +2287,7 @@ bool VulkanTextureCache::Initialize() {
   assert_true(host_format_bgrg.format_unsigned.format ==
               VK_FORMAT_B8G8R8G8_422_UNORM_KHR);
   assert_true(host_format_bgrg.format_signed.format ==
-              VK_FORMAT_R8G8B8A8_SNORM);
+              VK_FORMAT_R8G8B8A8_UNORM);
   ifn.vkGetPhysicalDeviceFormatProperties(
       physical_device, VK_FORMAT_B8G8R8G8_422_UNORM_KHR, &format_properties);
   if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) !=
@@ -2258,6 +2295,9 @@ bool VulkanTextureCache::Initialize() {
     host_format_bgrg.format_unsigned.load_shader = kLoadShaderIndexBGRG8ToRGB8;
     host_format_bgrg.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
     host_format_bgrg.format_unsigned.block_compressed = false;
+    host_format_bgrg.format_signed.load_shader = kLoadShaderIndexBGRG8ToRGB8;
+    host_format_bgrg.format_signed.format = VK_FORMAT_R8G8B8A8_UNORM;
+    host_format_bgrg.format_signed.block_compressed = false;
     host_format_bgrg.unsigned_signed_compatible = true;
   }
   // TODO(Triang3l): k_10_11_11 -> filterable R16G16B16A16_SFLOAT (enough

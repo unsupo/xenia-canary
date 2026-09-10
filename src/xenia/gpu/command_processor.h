@@ -186,6 +186,21 @@ class CommandProcessor {
   void Pause();
   void Resume();
 
+  // True once the ring buffer has been fully consumed (read pointer caught up
+  // to the write pointer): the emulated GPU is idle with no pending work. Used
+  // by the frame-pacing fence publisher to know it is safe to report "GPU
+  // caught up" to the guest.
+  bool is_ring_drained() const {
+    return read_ptr_index_ == write_ptr_index_.load(std::memory_order_relaxed);
+  }
+  // As above, but also true when the worker is stalled in an unsatisfied
+  // WAIT_REG_MEM: it has consumed every packet it can until the guest writes
+  // the value it is polling for.
+  bool is_ring_idle() const {
+    return is_ring_drained() ||
+           wait_reg_mem_parked_.load(std::memory_order_relaxed);
+  }
+
   bool Save(ByteStream* stream);
   bool Restore(ByteStream* stream);
 
@@ -517,6 +532,11 @@ class CommandProcessor {
   kernel::object_ref<kernel::XHostThread> worker_thread_;
 
   std::queue<std::function<void()>> pending_fns_;
+  // Guards pending_fns_. CallInThread() can push from arbitrary guest threads
+  // (e.g. the VdSwap path) while the worker pops - and the worker now also
+  // drains it from inside a stalled WAIT_REG_MEM. std::queue is not
+  // thread-safe; without this the concurrent push/pop corrupts the deque.
+  std::mutex pending_fns_mutex_;
 
   // MicroEngine binary from PM4_ME_INIT
   std::vector<uint32_t> me_bin_;
@@ -532,6 +552,30 @@ class CommandProcessor {
 
   std::unique_ptr<xe::threading::Event> write_ptr_index_event_;
   std::atomic<uint32_t> write_ptr_index_;
+  // Count of guest ring-buffer kickoffs (submissions), published as the
+  // emulated GPU "completed submissions" identifier once the ring is drained.
+  std::atomic<uint32_t> kickoff_count_{0};
+  // Incremented on each IssueSwap (real frame presentation). Used as the
+  // "genuine forward progress" signal by the WAIT_REG_MEM deadlock breaker.
+  std::atomic<uint32_t> swap_request_count_{0};
+  // Set while the worker is parked in a PM4 WAIT_REG_MEM memory poll that isn't
+  // being satisfied - i.e. the ring isn't literally drained but the GPU has
+  // consumed everything it can until the guest feeds it more. The frame-pacing
+  // fence publisher treats this the same as a drained ring.
+  std::atomic<bool> wait_reg_mem_parked_{false};
+  // Set by a memory WAIT_REG_MEM that has spun far past any plausible latency
+  // while the guest producer is itself blocked on the GPU (a CPU<->GPU
+  // handshake deadlock with no async GPU to break it). The primary-buffer and
+  // indirect-buffer executors check it and bail out to the ring head so the
+  // guest sees the GPU drained, unblocks, and re-submits the batch.
+  bool wrm_deadlock_abort_ = false;
+  // Wall-clock deadlock detection for the WAIT_REG_MEM handshake: the host
+  // uptime (ms) at which the worker last made real forward progress (executed
+  // a non-WAIT_REG_MEM packet), and a snapshot of counter_ at that time. If a
+  // WAIT_REG_MEM keeps churning (re-entering, each time matching then stalling
+  // again) with counter_ frozen for seconds, that's the CPU<->GPU standoff.
+  uint64_t wrm_last_progress_ms_ = 0;
+  uint32_t wrm_last_progress_counter_ = 0;
 
   uint64_t bin_select_ = 0xFFFFFFFFull;
   uint64_t bin_mask_ = 0xFFFFFFFFull;

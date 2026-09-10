@@ -51,6 +51,14 @@ bool IsArm64LoadPrefetchStore(uint32_t instruction, bool& is_store_out) {
     is_store_out = !(instruction & kArm64LoadStorePairLoadBit);
     return true;
   }
+  if ((instruction & kArm64LoadStoreExclusiveFMask) ==
+      kArm64LoadStoreExclusiveFixed) {
+    // Covers LDAR/STLR (and LDXR/STXR/LDAXR/STLXR/CAS, though this backend
+    // doesn't currently emit those where a fault could reach here) - see the
+    // comment on kArm64LoadStoreExclusiveFMask.
+    is_store_out = !(instruction & kArm64LoadStoreExclusiveLoadBit);
+    return true;
+  }
   switch (Arm64LoadStoreOp(instruction & kArm64LoadStoreMask)) {
     case Arm64LoadStoreOp::kLDRB_w:
     case Arm64LoadStoreOp::kLDRH_w:

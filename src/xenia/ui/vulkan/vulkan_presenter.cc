@@ -2141,11 +2141,16 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
         dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
   }
   switch (present_result) {
-    case VK_SUCCESS:
-      XELOGI("VulkanPresenter: Swapchain image presented (VK_SUCCESS)");
+    case VK_SUCCESS: {
+      // (was an unthrottled XELOGI per frame - the log write per line is a
+      // measurable slice of frame time on this port. Keep a heartbeat.)
+      static std::atomic<uint32_t> present_log{0};
+      if ((present_log++ & 0xFF) == 0) {
+        XELOGI("VulkanPresenter: presenting (frame heartbeat, 1/256)");
+      }
       return PaintResult::kPresented;
+    }
     case VK_SUBOPTIMAL_KHR:
-      XELOGI("VulkanPresenter: Swapchain image presented (VK_SUBOPTIMAL_KHR)");
       return PaintResult::kPresentedSuboptimal;
     case VK_ERROR_DEVICE_LOST:
       XELOGE(

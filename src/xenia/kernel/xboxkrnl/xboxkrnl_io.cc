@@ -64,6 +64,7 @@ dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
   XELOGI("NtCreateFile path='{}'", target_path);
   xe::FlushLog();
 
+
   // Enforce that the path is ASCII.
   if (!IsValidPath(target_path, false)) {
     return X_STATUS_OBJECT_NAME_INVALID;

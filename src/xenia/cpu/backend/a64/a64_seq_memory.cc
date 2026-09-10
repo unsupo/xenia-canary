@@ -119,11 +119,27 @@ struct CACHE_CONTROL
 };
 EMITTER_OPCODE_TABLE(OPCODE_CACHE_CONTROL, CACHE_CONTROL);
 
+// The Xbox 360 exposes the GPU/hardware register aperture (0x7FC00000-
+// 0x7FFFFFFF) a second time, uncached, at 0xFFC00000-0xFFFFFFFF (bit 31 set).
+// The Direct3D runtime polls the GPU progress/swap counter through that
+// uncached mirror specifically (a cached read would never observe the GPU's
+// updates). Fold the mirror back onto the canonical aperture so the MMIO
+// range lookup and the register handlers see it. Fable II's frame pacing
+// deadlocks on a black screen without this - it spins forever on a mirror
+// read that would otherwise hit plain, never-updated guest RAM.
+static XE_FORCEINLINE unsigned int NormalizeMmioMirror(unsigned int guestaddr) {
+  if (guestaddr >= 0xFFC00000) {
+    return guestaddr & 0x7FFFFFFF;
+  }
+  return guestaddr;
+}
+
 template <typename T, bool swap>
 static void MMIOAwareStore(void* _ctx, unsigned int guestaddr, T value) {
   if (swap) {
     value = xe::byte_swap(value);
   }
+  guestaddr = NormalizeMmioMirror(guestaddr);
   if (guestaddr >= 0xE0000000) {
     guestaddr += 0x1000;
   }
@@ -140,6 +156,7 @@ static void MMIOAwareStore(void* _ctx, unsigned int guestaddr, T value) {
 template <typename T, bool swap>
 static T MMIOAwareLoad(void* _ctx, unsigned int guestaddr) {
   T value;
+  guestaddr = NormalizeMmioMirror(guestaddr);
   if (guestaddr >= 0xE0000000) {
     guestaddr += 0x1000;
   }
@@ -200,12 +217,15 @@ struct LOAD_I32 : Sequence<LOAD_I32, I<OPCODE_LOAD, I32Op, I64Op>> {
       }
       auto& normal_access = e.NewCachedLabel();
       auto& done = e.NewCachedLabel();
+      // Fold the uncached hardware-register mirror (0xFFC00000-0xFFFFFFFF)
+      // onto the canonical aperture (0x7FC00000-0x7FFFFFFF) for the range
+      // test and the MMIO call (see NormalizeMmioMirror). Clobbering w17 is
+      // safe - the normal_access path recomputes the address from i.src*.
+      e.and_(e.w17, e.w17, 0x7FFFFFFFu);
       e.mov(e.w0, 0x7FC00000u);
       e.cmp(e.w17, e.w0);
       e.b(LO, normal_access);
-      e.mov(e.w0, 0x7FFFFFFFu);
-      e.cmp(e.w17, e.w0);
-      e.b(HI, normal_access);
+      // Upper bound is implicit now that bit 31 has been cleared.
       // MMIO path
       void* mmio_fn = (void*)&MMIOAwareLoad<uint32_t, false>;
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
@@ -218,6 +238,24 @@ struct LOAD_I32 : Sequence<LOAD_I32, I<OPCODE_LOAD, I32Op, I64Op>> {
       e.L(normal_access);
       {
         auto addr = ComputeMemoryAddress(e, i.src1);
+        // NOTE (macos-arm64 investigation): tried LDAR/STLR (acquire/
+        // release) here instead of plain ldr/str, on the theory that some
+        // guest code relies on cross-thread visibility a strongly-ordered
+        // host (x86, real Xbox 360 hardware) provides for free without
+        // explicit barriers, which ARM64's weak memory model doesn't extend
+        // to plain ldr/str. Tested with exception_handler.cc's
+        // IsArm64LoadPrefetchStore taught to recognize LDAR/STLR (see
+        // kArm64LoadStoreExclusiveFMask there, kept), ruling out the
+        // earlier write-watch-misclassification confound - the acquire/
+        // release version ran correctly (no fault loop) for 10+ minutes
+        // with the suspect guest polling loop cycling through the exact
+        // same functions the whole time, never resolving. That disproves
+        // this specific fix, not necessarily the underlying theory that
+        // guest code assumes stronger ordering than ARM64 provides -  the
+        // producer side of whatever this loop polls may need the fix
+        // instead/also. Reverted to plain ldr/str since this had no
+        // measurable benefit and adds cost; kept the decoder fix since it's
+        // independently correct.
         e.ldr(i.dest, ptr(e.GetMembaseReg(), addr));
         if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
           e.rev(i.dest, i.dest);
@@ -226,6 +264,7 @@ struct LOAD_I32 : Sequence<LOAD_I32, I<OPCODE_LOAD, I32Op, I64Op>> {
       e.L(done);
     } else {
       auto addr = ComputeMemoryAddress(e, i.src1);
+      // See the LDAR/STLR note above.
       e.ldr(i.dest, ptr(e.GetMembaseReg(), addr));
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
         e.rev(i.dest, i.dest);
@@ -346,12 +385,15 @@ struct STORE_I32 : Sequence<STORE_I32, I<OPCODE_STORE, VoidOp, I64Op, I32Op>> {
       }
       auto& normal_access = e.NewCachedLabel();
       auto& done = e.NewCachedLabel();
+      // Fold the uncached hardware-register mirror (0xFFC00000-0xFFFFFFFF)
+      // onto the canonical aperture (0x7FC00000-0x7FFFFFFF) for the range
+      // test and the MMIO call (see NormalizeMmioMirror). Clobbering w17 is
+      // safe - the normal_access path recomputes the address from i.src*.
+      e.and_(e.w17, e.w17, 0x7FFFFFFFu);
       e.mov(e.w0, 0x7FC00000u);
       e.cmp(e.w17, e.w0);
       e.b(LO, normal_access);
-      e.mov(e.w0, 0x7FFFFFFFu);
-      e.cmp(e.w17, e.w0);
-      e.b(HI, normal_access);
+      // Upper bound is implicit now that bit 31 has been cleared.
       // MMIO path — copy value to w2 before w1 in case src2 is in w1
       void* mmio_fn = (void*)&MMIOAwareStore<uint32_t, false>;
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
@@ -369,6 +411,7 @@ struct STORE_I32 : Sequence<STORE_I32, I<OPCODE_STORE, VoidOp, I64Op, I32Op>> {
       e.L(normal_access);
       {
         auto addr = ComputeMemoryAddress(e, i.src1);
+        // See the LDAR/STLR note in LOAD_I32 above (reverted).
         if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
           if (i.src2.is_constant) {
             uint32_t val =
@@ -533,14 +576,14 @@ EMITTER_OPCODE_TABLE(OPCODE_LOAD_CLOCK, LOAD_CLOCK);
 struct LOAD_OFFSET_I8
     : Sequence<LOAD_OFFSET_I8, I<OPCODE_LOAD_OFFSET, I8Op, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    AddGuestMemoryOffset(e, ComputeMemoryAddress(e, i.src1), i.src2);
+    ComputeMemoryAddressWithOffset(e, i.src1, i.src2);
     e.ldrb(i.dest, ptr(e.GetMembaseReg(), e.x0));
   }
 };
 struct LOAD_OFFSET_I16
     : Sequence<LOAD_OFFSET_I16, I<OPCODE_LOAD_OFFSET, I16Op, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    AddGuestMemoryOffset(e, ComputeMemoryAddress(e, i.src1), i.src2);
+    ComputeMemoryAddressWithOffset(e, i.src1, i.src2);
     e.ldrh(i.dest, ptr(e.GetMembaseReg(), e.x0));
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       e.rev16(i.dest, i.dest);
@@ -591,12 +634,15 @@ struct LOAD_OFFSET_I32
       }
       auto& normal_access = e.NewCachedLabel();
       auto& done = e.NewCachedLabel();
+      // Fold the uncached hardware-register mirror (0xFFC00000-0xFFFFFFFF)
+      // onto the canonical aperture (0x7FC00000-0x7FFFFFFF) for the range
+      // test and the MMIO call (see NormalizeMmioMirror). Clobbering w17 is
+      // safe - the normal_access path recomputes the address from i.src*.
+      e.and_(e.w17, e.w17, 0x7FFFFFFFu);
       e.mov(e.w0, 0x7FC00000u);
       e.cmp(e.w17, e.w0);
       e.b(LO, normal_access);
-      e.mov(e.w0, 0x7FFFFFFFu);
-      e.cmp(e.w17, e.w0);
-      e.b(HI, normal_access);
+      // Upper bound is implicit now that bit 31 has been cleared.
       // MMIO path
       void* mmio_fn = (void*)&MMIOAwareLoad<uint32_t, false>;
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
@@ -608,7 +654,7 @@ struct LOAD_OFFSET_I32
       e.b(done);
       e.L(normal_access);
       {
-        AddGuestMemoryOffset(e, ComputeMemoryAddress(e, i.src1), i.src2);
+        ComputeMemoryAddressWithOffset(e, i.src1, i.src2);
         e.ldr(i.dest, ptr(e.GetMembaseReg(), e.x0));
         if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
           e.rev(i.dest, i.dest);
@@ -616,7 +662,7 @@ struct LOAD_OFFSET_I32
       }
       e.L(done);
     } else {
-      AddGuestMemoryOffset(e, ComputeMemoryAddress(e, i.src1), i.src2);
+      ComputeMemoryAddressWithOffset(e, i.src1, i.src2);
       e.ldr(i.dest, ptr(e.GetMembaseReg(), e.x0));
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
         e.rev(i.dest, i.dest);
@@ -627,7 +673,7 @@ struct LOAD_OFFSET_I32
 struct LOAD_OFFSET_I64
     : Sequence<LOAD_OFFSET_I64, I<OPCODE_LOAD_OFFSET, I64Op, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    AddGuestMemoryOffset(e, ComputeMemoryAddress(e, i.src1), i.src2);
+    ComputeMemoryAddressWithOffset(e, i.src1, i.src2);
     e.ldr(i.dest, ptr(e.GetMembaseReg(), e.x0));
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       e.rev(i.dest, i.dest);
@@ -641,7 +687,7 @@ struct STORE_OFFSET_I8
     : Sequence<STORE_OFFSET_I8,
                I<OPCODE_STORE_OFFSET, VoidOp, I64Op, I64Op, I8Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    AddGuestMemoryOffset(e, ComputeMemoryAddress(e, i.src1), i.src2);
+    ComputeMemoryAddressWithOffset(e, i.src1, i.src2);
     if (i.src3.is_constant) {
       e.mov(e.w17, static_cast<uint64_t>(i.src3.constant() & 0xFF));
       e.strb(e.w17, ptr(e.GetMembaseReg(), e.x0));
@@ -654,7 +700,7 @@ struct STORE_OFFSET_I16
     : Sequence<STORE_OFFSET_I16,
                I<OPCODE_STORE_OFFSET, VoidOp, I64Op, I64Op, I16Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    AddGuestMemoryOffset(e, ComputeMemoryAddress(e, i.src1), i.src2);
+    ComputeMemoryAddressWithOffset(e, i.src1, i.src2);
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       if (i.src3.is_constant) {
         uint16_t val = xe::byte_swap(static_cast<uint16_t>(i.src3.constant()));
@@ -723,12 +769,15 @@ struct STORE_OFFSET_I32
       }
       auto& normal_access = e.NewCachedLabel();
       auto& done = e.NewCachedLabel();
+      // Fold the uncached hardware-register mirror (0xFFC00000-0xFFFFFFFF)
+      // onto the canonical aperture (0x7FC00000-0x7FFFFFFF) for the range
+      // test and the MMIO call (see NormalizeMmioMirror). Clobbering w17 is
+      // safe - the normal_access path recomputes the address from i.src*.
+      e.and_(e.w17, e.w17, 0x7FFFFFFFu);
       e.mov(e.w0, 0x7FC00000u);
       e.cmp(e.w17, e.w0);
       e.b(LO, normal_access);
-      e.mov(e.w0, 0x7FFFFFFFu);
-      e.cmp(e.w17, e.w0);
-      e.b(HI, normal_access);
+      // Upper bound is implicit now that bit 31 has been cleared.
       // MMIO path — copy value to w2 before w1 in case src3 is in w1
       void* mmio_fn = (void*)&MMIOAwareStore<uint32_t, false>;
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
@@ -745,7 +794,7 @@ struct STORE_OFFSET_I32
       e.b(done);
       e.L(normal_access);
       {
-        AddGuestMemoryOffset(e, ComputeMemoryAddress(e, i.src1), i.src2);
+        ComputeMemoryAddressWithOffset(e, i.src1, i.src2);
         if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
           if (i.src3.is_constant) {
             uint32_t val =
@@ -767,7 +816,7 @@ struct STORE_OFFSET_I32
       }
       e.L(done);
     } else {
-      AddGuestMemoryOffset(e, ComputeMemoryAddress(e, i.src1), i.src2);
+      ComputeMemoryAddressWithOffset(e, i.src1, i.src2);
       if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
         if (i.src3.is_constant) {
           uint32_t val =
@@ -793,7 +842,7 @@ struct STORE_OFFSET_I64
     : Sequence<STORE_OFFSET_I64,
                I<OPCODE_STORE_OFFSET, VoidOp, I64Op, I64Op, I64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    AddGuestMemoryOffset(e, ComputeMemoryAddress(e, i.src1), i.src2);
+    ComputeMemoryAddressWithOffset(e, i.src1, i.src2);
     if (i.instr->flags & LoadStoreFlags::LOAD_STORE_BYTE_SWAP) {
       if (i.src3.is_constant) {
         uint64_t val = xe::byte_swap(static_cast<uint64_t>(i.src3.constant()));

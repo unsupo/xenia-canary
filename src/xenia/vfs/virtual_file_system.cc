@@ -290,7 +290,11 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
     // return X_STATUS_ACCESS_DENIED;
     // TODO(benvanik): figure out why games are opening read-only files with
     // write modes.
-    assert_always();
+    // This is a routine, already-handled case (we downgrade to read-only
+    // below and warn about it) - some titles (e.g. Fable II, opening
+    // D:\lhdebug.log) hit it on every run, and assert_always() traps on
+    // Checked builds on non-Windows platforms, making Checked builds
+    // unusable for those titles. Keep the warning, drop the trap.
     XELOGW("Attempted to open the file/dir for create/write");
     desired_access = FileAccess::kGenericRead | FileAccess::kFileReadData;
   }

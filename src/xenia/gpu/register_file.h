@@ -76,6 +76,14 @@ class RegisterFile {
     return fetch;
   }
 
+  void SetTextureFetch(uint32_t index,
+                       const xenos::xe_gpu_texture_fetch_t& fetch) {
+    assert_true(index < 32);
+    std::memcpy(&values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 +
+                        (sizeof(fetch) / sizeof(uint32_t)) * index],
+                &fetch, sizeof(fetch));
+  }
+
   xenos::xe_gpu_memexport_stream_t GetMemExportStream(
       uint32_t float_constant_index) const {
     assert_true(float_constant_index < 512);

@@ -584,7 +584,7 @@ bool VulkanCommandProcessor::SetupContext() {
     VkDeviceSize kDivergentGatherBufferSize =
         VkDeviceSize(
             divergent_gather_diag
-                ? SpirvShaderTranslator::kDivergentGatherDiagPsEndVec4
+                ? SpirvShaderTranslator::kDivergentGatherDiagConstsFrozenEndVec4
                 : SpirvShaderTranslator::kDivergentGatherResultsBaseVec4 +
                       VkDeviceSize(
                           SpirvShaderTranslator::kDivergentGatherMaxVertices) *
@@ -1574,8 +1574,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                                        uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
-  XELOGI("VulkanCommandProcessor::IssueSwap called (fb_ptr={:08X}, {}x{})",
-         frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  swap_request_count_.fetch_add(1, std::memory_order_relaxed);
 
   ui::Presenter* presenter = graphics_system_->presenter();
   if (!presenter) {
@@ -1639,6 +1638,31 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
           }
           dg_dfn.vkUnmapMemory(dg_dev->device(), divergent_gather_buffer_memory_);
         }
+        // Frozen float-constant snapshot for the XE_DGATHER_IDXCOUNT draw
+        // specifically (gather[0..255] itself gets overwritten by every later
+        // eligible draw in the frame, so it can't be read back here reliably).
+        // Diff against "_dgdiag_regfile.raw" (live RegisterFile ground truth
+        // for the same draw) to check the constant-buffer upload path.
+        void* consts_mapped = nullptr;
+        VkDeviceSize consts_off =
+            VkDeviceSize(SpirvShaderTranslator::
+                             kDivergentGatherDiagConstsFrozenBaseVec4) *
+            16u;
+        if (dg_dfn.vkMapMemory(dg_dev->device(), divergent_gather_buffer_memory_,
+                               consts_off, 256 * 16, 0,
+                               &consts_mapped) == VK_SUCCESS) {
+          std::string path = fmt::format("{}_dgdiag_consts.raw", dg_diag);
+          FILE* f = std::fopen(path.c_str(), "wb");
+          if (f) {
+            std::fwrite(consts_mapped, 1, 256 * 16, f);
+            std::fclose(f);
+            XELOGI("XE_DGATHER_DIAG wrote {} (4096 bytes; gather[0..255] "
+                   "float-constant UBO snapshot as of the LAST divergent-"
+                   "gather draw in the frame)",
+                   path);
+          }
+          dg_dfn.vkUnmapMemory(dg_dev->device(), divergent_gather_buffer_memory_);
+        }
         // Pixel-shader probe region: one vec4 per screen pixel (W*H), keyed by
         // min(y,H-1)*W + min(x,W-1), holding {rN.xyz, 1.0}.
         VkDeviceSize ps_off =
@@ -1699,7 +1723,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
   uint32_t frontbuffer_width_scaled, frontbuffer_height_scaled;
   xenos::TextureFormat frontbuffer_format;
   VkImageView swap_texture_view = texture_cache_->RequestSwapTexture(
-      frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_format);
+      frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_format,
+      frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
   if (swap_texture_view == VK_NULL_HANDLE) {
     return;
   }
@@ -3186,6 +3211,34 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       !vertex_shader->memexport_eM_written() &&
       vertex_shader->GetTextureBindingsAfterTranslation().empty() &&
       primitive_processing_result.host_draw_vertex_count != 0) {
+    // XE_DGATHER_DIAG + XE_DGATHER_IDXCOUNT: ground-truth dump of the live
+    // RegisterFile float constants (c[0..255], reflecting every PM4
+    // SET_CONSTANT applied so far) for the matching draw, to diff against the
+    // UBO snapshot the gather pre-pass reads from (dumped separately in
+    // IssueSwap as gather[0..255] -> "_dgdiag_consts.raw"). If they differ,
+    // the bug is in constant-buffer upload/dirty-tracking, not the shader.
+    if (const char* dg_diag = std::getenv("XE_DGATHER_DIAG")) {
+      const char* idxc_env = std::getenv("XE_DGATHER_IDXCOUNT");
+      if (idxc_env &&
+          primitive_processing_result.host_draw_vertex_count ==
+              uint32_t(atoi(idxc_env))) {
+        std::string path = fmt::format("{}_dgdiag_regfile.raw", dg_diag);
+        FILE* f = std::fopen(path.c_str(), "wb");
+        if (f) {
+          float buf[256 * 4];
+          for (uint32_t i = 0; i < 256 * 4; ++i) {
+            buf[i] = register_file_->Get<float>(
+                XE_GPU_REG_SHADER_CONSTANT_000_X + i);
+          }
+          std::fwrite(buf, sizeof(buf), 1, f);
+          std::fclose(f);
+          XELOGI(
+              "XE_DGATHER_DIAG wrote {} ({} bytes; live RegisterFile "
+              "c[0..255], ground truth for the matching draw)",
+              path, sizeof(buf));
+        }
+      }
+    }
     VkPipeline prepass_pipeline =
         pipeline_cache_->GetOrCreateDivergentGatherComputePipeline(
             vertex_shader_translation, divergent_gather_pipeline_layout_);
@@ -3217,6 +3270,26 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       deferred_command_buffer_.CmdVkCopyBuffer(
           divergent_gather_float_constants.buffer, divergent_gather_buffer_, 1,
           &divergent_gather_fc_copy);
+      // XE_DGATHER_DIAG + XE_DGATHER_IDXCOUNT: also freeze this draw's constant
+      // snapshot into a dedicated region so a later draw sharing the shader
+      // doesn't overwrite gather[0..255] before IssueSwap reads it back.
+      if (std::getenv("XE_DGATHER_DIAG")) {
+        const char* idxc_env = std::getenv("XE_DGATHER_IDXCOUNT");
+        if (idxc_env && primitive_processing_result.host_draw_vertex_count ==
+                            uint32_t(atoi(idxc_env))) {
+          VkBufferCopy divergent_gather_fc_freeze_copy;
+          divergent_gather_fc_freeze_copy.srcOffset =
+              divergent_gather_float_constants.offset;
+          divergent_gather_fc_freeze_copy.dstOffset =
+              VkDeviceSize(SpirvShaderTranslator::
+                               kDivergentGatherDiagConstsFrozenBaseVec4) *
+              sizeof(float) * 4;
+          divergent_gather_fc_freeze_copy.size = divergent_gather_fc_copy.size;
+          deferred_command_buffer_.CmdVkCopyBuffer(
+              divergent_gather_float_constants.buffer, divergent_gather_buffer_,
+              1, &divergent_gather_fc_freeze_copy);
+        }
+      }
       PushBufferMemoryBarrier(
           divergent_gather_buffer_, 0, VK_WHOLE_SIZE,
           VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,

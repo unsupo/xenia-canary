@@ -693,9 +693,11 @@ class TextureCache {
   uint64_t current_submission_index_ = 0;
   uint64_t current_submission_time_ = 0;
 
+ protected:
   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKey::Hasher>
       textures_;
 
+ private:
   uint64_t textures_total_host_memory_usage_ = 0;
 
   Texture* texture_used_first_ = nullptr;

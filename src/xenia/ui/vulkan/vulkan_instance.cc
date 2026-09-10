@@ -618,6 +618,24 @@ VkBool32 VulkanInstance::DebugUtilsMessengerCallback(
     VkDebugUtilsMessageTypeFlagsEXT message_types,
     const VkDebugUtilsMessengerCallbackDataEXT* callback_data,
     [[maybe_unused]] void* user_data) {
+  // macos-arm64: MoltenVK emits some warnings once per pipeline/frame - most
+  // notably "Metal does not support disabling primitive restart" - and building
+  // the formatted string + flushing the log for each is a real per-frame cost.
+  // Rate-limit anything below Error severity that repeats the same message id.
+  if (message_severity < VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT &&
+      callback_data) {
+    static std::atomic<int32_t> last_id{INT32_MIN};
+    static std::atomic<uint32_t> repeat{0};
+    int32_t id = callback_data->messageIdNumber;
+    if (last_id.exchange(id, std::memory_order_relaxed) == id) {
+      if ((repeat.fetch_add(1, std::memory_order_relaxed) & 0x1FF) != 0) {
+        return VK_FALSE;
+      }
+    } else {
+      repeat.store(0, std::memory_order_relaxed);
+    }
+  }
+
   xe::LogLevel log_level;
   char log_prefix_char;
   if (message_severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {

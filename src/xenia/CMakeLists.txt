@@ -48,7 +48,14 @@ endif()
 if(WIN32)
   add_subdirectory(apu/xaudio2)
   add_subdirectory(gpu/d3d12)
-  add_subdirectory(hid/winkey)
   add_subdirectory(hid/xinput)
   add_subdirectory(ui/d3d12)
+endif()
+
+# WinKey provides keyboard->XInput-pad emulation. Its event path
+# (WinKeyWindowInputListener) is portable; on non-Windows the held-key poll is
+# serviced from key_state_ instead of GetAsyncKeyState. macOS has no other
+# keyboard input driver, so build it there too.
+if(WIN32 OR APPLE)
+  add_subdirectory(hid/winkey)
 endif()

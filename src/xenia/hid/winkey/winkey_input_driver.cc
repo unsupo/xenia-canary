@@ -10,7 +10,18 @@
 #include "xenia/hid/winkey/winkey_input_driver.h"
 
 #include "xenia/base/logging.h"
+#include "xenia/base/platform.h"
+#if XE_PLATFORM_WIN32
 #include "xenia/base/platform_win.h"
+#else
+// Windows virtual-key constants the shared code below references. ui::VirtualKey
+// values are defined to match VK_ codes exactly (see virtual_key.h), so only the
+// few used here need spelling out on non-Windows builds.
+#define VK_SHIFT 0x10
+#define VK_CONTROL 0x11
+#define VK_MENU 0x12
+#define VK_CAPITAL 0x14
+#endif
 #include "xenia/hid/hid_flags.h"
 #include "xenia/hid/input_system.h"
 #include "xenia/ui/virtual_key.h"
@@ -25,7 +36,14 @@
 #include "winkey_binding_table.inc"
 #undef XE_HID_WINKEY_BINDING
 
-DEFINE_int32(keyboard_mode, 0,
+#if XE_PLATFORM_MAC
+// macOS has no other keyboard input path, so default it on (keyboard emulates
+// controller slot 0). Overridable via config / --keyboard_mode.
+#define XE_WINKEY_DEFAULT_KEYBOARD_MODE 1
+#else
+#define XE_WINKEY_DEFAULT_KEYBOARD_MODE 0
+#endif
+DEFINE_int32(keyboard_mode, XE_WINKEY_DEFAULT_KEYBOARD_MODE,
              "Allows user do specify keyboard working mode. Possible values: 0 "
              "- Disabled, 1 - Enabled, 2 - Passthrough. Passthrough requires "
              "controller being connected!",
@@ -41,6 +59,7 @@ namespace xe {
 namespace hid {
 namespace winkey {
 
+#if XE_PLATFORM_WIN32
 static uint8_t VirtualKeyToHIDUsage(UINT vk) {
   // Letters: contiguous in both VK and HID space
   if (vk >= 'A' && vk <= 'Z') {
@@ -159,6 +178,7 @@ static uint8_t VirtualKeyToHIDUsage(UINT vk) {
   }
   return 0x00;
 }
+#endif  // XE_PLATFORM_WIN32
 
 bool static IsPassthroughEnabled() {
   return static_cast<KeyboardMode>(cvars::keyboard_mode) ==
@@ -174,16 +194,20 @@ bool static IsKeyboardForUserEnabled(uint32_t user_index) {
   return cvars::keyboard_user_index == user_index;
 }
 
-bool __inline IsKeyToggled(uint8_t key) {
+bool WinKeyInputDriver::IsKeyToggled(uint8_t key) const {
+#if XE_PLATFORM_WIN32
   return (GetKeyState(key) & 0x1) == 0x1;
+#else
+  return key_toggle_[key].load(std::memory_order_relaxed);
+#endif
 }
 
-bool __inline IsKeyDown(uint8_t key) {
+bool WinKeyInputDriver::IsKeyDown(uint8_t key) const {
+#if XE_PLATFORM_WIN32
   return (GetAsyncKeyState(key) & 0x8000) == 0x8000;
-}
-
-bool __inline IsKeyDown(ui::VirtualKey virtual_key) {
-  return IsKeyDown(static_cast<uint8_t>(virtual_key));
+#else
+  return key_state_[key].load(std::memory_order_relaxed);
+#endif
 }
 
 void WinKeyInputDriver::ParseKeyBinding(ui::VirtualKey output_key,
@@ -385,7 +409,7 @@ X_RESULT WinKeyInputDriver::GetState(uint32_t user_index,
   out_state->gamepad.thumb_ry = thumb_ry;
 
   if (IsPassthroughEnabled()) {
-    memset(out_state, 0, sizeof(out_state));
+    memset(out_state, 0, sizeof(*out_state));
   }
 
   return X_ERROR_SUCCESS;
@@ -462,6 +486,7 @@ X_RESULT WinKeyInputDriver::GetKeystroke(uint32_t user_index, uint32_t flags,
       keystroke_flags |= 0x0002;  // XINPUT_KEYSTROKE_KEYUP
     }
 
+#if XE_PLATFORM_WIN32
     if (IsPassthroughEnabled()) {
       const UINT vk = static_cast<UINT>(xinput_virtual_key);
       hid_code = VirtualKeyToHIDUsage(vk);
@@ -474,6 +499,7 @@ X_RESULT WinKeyInputDriver::GetKeystroke(uint32_t user_index, uint32_t flags,
         }
       }
     }
+#endif  // XE_PLATFORM_WIN32
 
     result = X_ERROR_SUCCESS;
   }
@@ -509,6 +535,24 @@ void WinKeyInputDriver::OnKey(ui::KeyEvent& e, bool is_down) {
   key.transition = is_down;
   key.prev_state = e.prev_state();
   key.repeat_count = e.repeat_count();
+
+#if !XE_PLATFORM_WIN32
+  // Maintain the held/toggle state that IsKeyDown/IsKeyToggled poll (no
+  // GetAsyncKeyState off Windows). GetState() runs on the guest's input poll
+  // thread, so these are atomics rather than lock-guarded.
+  uint16_t vk = static_cast<uint16_t>(e.virtual_key());
+  if (vk < 256) {
+    if (is_down) {
+      if (!key_state_[vk].exchange(true, std::memory_order_relaxed)) {
+        // Rising edge flips the toggle bit (Caps/Num/Scroll Lock semantics;
+        // harmless for other keys since nothing polls their toggle).
+        key_toggle_[vk].fetch_xor(uint8_t(1), std::memory_order_relaxed);
+      }
+    } else {
+      key_state_[vk].store(false, std::memory_order_relaxed);
+    }
+  }
+#endif
 
   auto global_lock = global_critical_region_.Acquire();
   key_events_.push(key);

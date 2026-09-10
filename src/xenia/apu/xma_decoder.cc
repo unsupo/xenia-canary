@@ -389,12 +389,17 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
       case 0x601:
         break;
       default: {
-        const auto register_info = register_file_.GetRegisterInfo(r);
-        if (register_info) {
-          XELOGW("XMA: Write to unhandled register ({:04X}, {}): {:08X}", r,
-                 register_info->name, value);
-        } else {
-          XELOGW("XMA: Write to unknown register ({:04X}): {:08X}", r, value);
+        // Some titles (e.g. Fable II) poke XMA context registers we don't
+        // model every audio frame - throttle so it doesn't flood the log.
+        static std::atomic<uint32_t> xma_reg_warn{0};
+        if ((xma_reg_warn++ & 0x3FF) == 0) {
+          const auto register_info = register_file_.GetRegisterInfo(r);
+          if (register_info) {
+            XELOGW("XMA: Write to unhandled register ({:04X}, {}): {:08X}", r,
+                   register_info->name, value);
+          } else {
+            XELOGW("XMA: Write to unknown register ({:04X}): {:08X}", r, value);
+          }
         }
         break;
       }

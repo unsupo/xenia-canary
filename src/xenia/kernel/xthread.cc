@@ -118,22 +118,24 @@ XThread* XThread::GetCurrentThread() {
 
 uint32_t XThread::GetCurrentThreadHandle() {
   XThread* thread = XThread::GetCurrentThread();
-  return thread->handle();
+  return thread ? thread->handle() : 0;
 }
 
 uint32_t XThread::GetCurrentThreadId() {
   XThread* thread = XThread::GetCurrentThread();
-  return thread->guest_object<X_KTHREAD>()->thread_id;
+  return thread ? thread->thread_id() : 0;
 }
 
 uint32_t XThread::GetLastError() {
   XThread* thread = XThread::GetCurrentThread();
-  return thread->last_error();
+  return thread ? thread->last_error() : 0;
 }
 
 void XThread::SetLastError(uint32_t error_code) {
   XThread* thread = XThread::GetCurrentThread();
-  thread->set_last_error(error_code);
+  if (thread) {
+    thread->set_last_error(error_code);
+  }
 }
 
 uint32_t XThread::last_error() { return guest_object<X_KTHREAD>()->last_error; }
@@ -511,6 +513,15 @@ X_STATUS XThread::Exit(int exit_code) {
   xe::Profiler::ThreadExit();
 
   running_ = false;
+  // Keep the underlying OS thread wrapper alive across ReleaseHandle(): if
+  // this drops the last reference, it destroys `this` (including the
+  // cpu::Thread base's `thread_` unique_ptr), but xe::threading::Thread::Exit()
+  // below still needs that object to be alive - it self-terminates via a
+  // thread-local pointer set to the very object `thread_` owns, established
+  // back in ThreadStartRoutine. Moving it out first keeps it alive
+  // independent of `this`'s lifetime, closing a use-after-free race where a
+  // thread's last handle reference drops exactly as it self-exits.
+  auto self_thread_keepalive = std::move(thread_);
   ReleaseHandle();
 
   // NOTE: this does not return!
@@ -531,6 +542,10 @@ X_STATUS XThread::Terminate(int exit_code) {
 
   running_ = false;
   if (XThread::IsInThread(this)) {
+    // Same use-after-free hazard as XThread::Exit() above: keep the OS thread
+    // wrapper alive across ReleaseHandle() since Thread::Exit() below still
+    // needs it.
+    auto self_thread_keepalive = std::move(thread_);
     ReleaseHandle();
     xe::threading::Thread::Exit(exit_code);
   } else {
@@ -684,7 +699,15 @@ void XThread::RundownAPCs() {
   xboxkrnl::xeRundownApcs(thread_state_->context());
 }
 
-int32_t XThread::QueryPriority() { return thread_->priority(); }
+int32_t XThread::QueryPriority() {
+  // thread_ is moved out (and left null) once the thread has self-exited (see
+  // Exit()/Terminate()'s use-after-free fix), but the XThread object itself
+  // can outlive that if something else still holds a reference to it (e.g. a
+  // stale KTHREAD pointer another guest thread passes to
+  // KeSetBasePriorityThread). Fall back to the cached guest-visible priority
+  // rather than dereferencing a null thread_.
+  return thread_ ? thread_->priority() : priority_;
+}
 
 // Map Xenon's 0-31 priority range across the available host priority levels.
 // Priority 18 (0x12) is the Xenon real-time threshold — threads at or above
@@ -713,7 +736,7 @@ void XThread::SetPriority(int32_t increment) {
   priority_ = clamped;
   base_priority_ = clamped;
   quantum_start_ms_ = Clock::QueryHostUptimeMillis();
-  if (!cvars::ignore_thread_priorities) {
+  if (!cvars::ignore_thread_priorities && thread_) {
     thread_->set_priority(GuestPriorityToHost(clamped));
   }
 }
@@ -756,7 +779,9 @@ void XThread::CheckQuantumAndDecay() {
     if (is_guest_thread()) {
       guest_object<X_KTHREAD>()->priority = static_cast<uint8_t>(new_priority);
     }
-    thread_->set_priority(GuestPriorityToHost(new_priority));
+    if (thread_) {
+      thread_->set_priority(GuestPriorityToHost(new_priority));
+    }
   }
   quantum_start_ms_ = now;
 }
@@ -810,7 +835,9 @@ void XThread::BoostOnWake(int32_t increment) {
       if (is_guest_thread()) {
         guest_object<X_KTHREAD>()->priority = static_cast<uint8_t>(priority_);
       }
-      thread_->set_priority(GuestPriorityToHost(priority_));
+      if (thread_) {
+        thread_->set_priority(GuestPriorityToHost(priority_));
+      }
     }
   }
 
@@ -841,7 +868,7 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
   }
 
   if (xe::threading::logical_processor_count() >= 6) {
-    if (!cvars::ignore_thread_affinities) {
+    if (!cvars::ignore_thread_affinities && thread_) {
       thread_->set_affinity_mask(uint64_t(1) << cpu_index);
     }
   } else {
@@ -903,6 +930,9 @@ X_STATUS XThread::Resume(uint32_t* out_suspend_count) {
     *out_suspend_count = previous_suspend_count;
   }
 
+  if (!thread_) {
+    return X_STATUS_SUCCESS;
+  }
   if (thread_->Resume(&unused_host_suspend_count)) {
     return X_STATUS_SUCCESS;
   } else {
@@ -925,7 +955,7 @@ X_STATUS XThread::Resume(uint32_t* out_suspend_count) {
   }
 
   // Try to resume host thread if fully resumed (for non-self-suspended case).
-  if (should_resume_host) {
+  if (should_resume_host && thread_) {
     thread_->Resume(&unused_host_suspend_count);
   }
   return X_STATUS_SUCCESS;
@@ -953,6 +983,9 @@ X_STATUS XThread::Suspend(uint32_t* out_suspend_count) {
     return X_STATUS_SUCCESS;
   }
 
+  if (!thread_) {
+    return X_STATUS_SUCCESS;
+  }
   if (thread_->Suspend(&unused_host_suspend_count)) {
     return X_STATUS_SUCCESS;
   } else {

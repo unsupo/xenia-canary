@@ -75,6 +75,18 @@ class GraphicsSystem {
   virtual void SetInterruptCallback(uint32_t callback, uint32_t user_data);
   void DispatchInterruptCallback(uint32_t source, uint32_t cpu);
 
+  // VdSetSystemCommandBufferGpuIdentifierAddress: the guest address where the
+  // GPU is expected to publish a monotonically increasing "identifier"
+  // (== the swap/interrupt counter). Direct3D's frame pacing spins on this.
+  void SetGpuIdentifierAddress(uint32_t guest_address);
+  // Set the emulated GPU "completed submissions" identifier and publish it to
+  // the guest address. Called by the command processor once the ring buffer
+  // is drained (all kicked-off work processed).
+  void SetGpuIdentifierValue(uint32_t value);
+  // Re-publish the current identifier without changing it (e.g. from vblank,
+  // in case the guest relocated the address or the page was reused).
+  void PublishGpuIdentifier();
+
   virtual void ClearCaches();
 
   void InitializeShaderStorage(
@@ -119,6 +131,9 @@ class GraphicsSystem {
   Memory* memory_ = nullptr;
   cpu::Processor* processor_ = nullptr;
   kernel::KernelState* kernel_state_ = nullptr;
+  std::atomic<uint32_t> gpu_identifier_address_{0};
+  std::atomic<uint32_t> gpu_identifier_value_{0};
+  std::atomic<uint32_t> swap_sync_object_{0};
   ui::WindowedAppContext* app_context_ = nullptr;
   std::unique_ptr<ui::GraphicsProvider> provider_;
 
