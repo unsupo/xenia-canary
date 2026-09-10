@@ -777,16 +777,20 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
   // impossible poll up front and bail straight to the ring head.
   if (is_memory) {
     uint32_t phys = poll_reg_addr & ~uint32_t(0x3);
-    // A real Fable II memory WAIT_REG_MEM polls the GPU-adjacent region
-    // (0x1Fxxxxxx: system command buffer / ring / fence page / the 0x1FC800xx
-    // mailbox) - all of which xenia keeps mapped. Garbage decoded from a stale
-    // IB routinely produces a poll address elsewhere: past the 512 MB map, in
-    // the null guard, or - worse - a plausible-looking RAM address whose
-    // physical page was never committed, so the very first `value = value_ref`
-    // read below SIGSEGVs. Anything outside the always-mapped GPU window, or an
-    // unsatisfiable compare (mask==0 vs a non-zero ref under equality), is stale
-    // content: bail to the ring head instead of reading it.
-    bool addr_ok = phys >= 0x1F000000u && phys < 0x20000000u;
+    // A real Fable II / Halo 3 memory WAIT_REG_MEM polls only the GPU
+    // register/fence aperture (system command buffer, ring buffers, the
+    // 0x1FC81xxx fence page, the 0x1FC800xx CP<->CPU mailbox) - all in
+    // 0x1FC00000-0x1FDFFFFF and always mapped. Garbage decoded from a stale IB
+    // routinely yields a poll address elsewhere, and even a "plausible" one
+    // (e.g. 0x1F504000 in the on-demand D3D command pool, or a guest-code
+    // address like 0x82504000) whose page xenia has not committed - so the very
+    // first `value = value_ref` read below SIGSEGVs. Anything outside that
+    // aperture, or an unsatisfiable compare (mask==0 vs a non-zero ref under
+    // equality), is stale content: bail to the ring head instead of reading it.
+    // Tightest always-mapped bound: the mailbox / fence page / ring-buffer
+    // cluster (VdInitializeRingBuffer uses 0x1FC82000 and 0x1FC9A000). Every
+    // observed real poll is at 0x1FC800xx or 0x1FC81xxx.
+    bool addr_ok = phys >= 0x1FC80000u && phys < 0x1FCA0000u;
     bool satisfiable =
         addr_ok && (mask != 0 || MatchValueAndRef(0, ref, wait_info));
     if (!satisfiable) {

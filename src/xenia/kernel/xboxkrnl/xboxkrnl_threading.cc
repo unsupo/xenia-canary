@@ -514,31 +514,35 @@ DEFINE_bool(log_guest_yield_spin, false,
             "macos-arm64 bring-up: log the guest LR + fence values when a "
             "thread spins on NtYieldExecution (CPU<->GPU deadlock trace).",
             "Kernel");
+DEFINE_bool(
+    break_fable2_resource_wedge, false,
+    "macos-arm64 Fable II: when guest thread 0x15 spins forever at lr=0x82CBD0A8 "
+    "on an empty GPU-resource completion ring (title-screen wedge), step the "
+    "producer index so it dequeues one entry. PARTIAL - the game consumes the "
+    "synthetic completion and then deadlocks on a critical section further in "
+    "the consume path (0x821C3670 / 0x82228810 / 0x82A5AD18 not yet understood). "
+    "Off by default. See the trace in xboxkrnl_threading.cc.",
+    "Kernel");
 
 dword_result_t NtYieldExecution_entry(const ppc_context_t& ctx) {
-  // macos-arm64 Fable II bring-up: the game wedges at the title screen with two
-  // guest threads spinning on NtYieldExecution. Log where they spin (guest LR)
-  // and the value they're waiting on, once per wedge, so the CPU<->GPU deadlock
-  // can be traced without lldb. A "wedge" = the same guest LR calling us
-  // thousands of times in a row.
-  if (cvars::log_guest_yield_spin) {
-    // Report a *sustained* same-site spin (a real wedge, not the short yield
-    // bursts of normal play). Fully traced for Fable II's title-screen wedge:
-    // guest thread 0x15 (D3D resource producer) spins at lr=0x82CBD0A8 ->
-    // caller 0x822E062C -> pred 0x822A8E78 -> ring-advance 0x822943E8 (Rtl*
-    // CriticalSection-protected), polling *(pool[+4] + round4(pool[+0xC])) for a
-    // non-zero completion token. The pool's producer index pool[+0x3C] never
-    // advances past the consumer index pool[+0xC] - nothing ever posts to this
-    // GPU-resource completion ring. r31 = the pool struct (e.g. 0x42205100).
+  // macos-arm64 Fable II bring-up. Fully traced (see git log): guest thread
+  // 0x15 (D3D resource producer) wedges at the title screen spinning at
+  // lr=0x82CBD0A8 -> caller 0x822E062C -> readiness predicate 0x822A8E78, which
+  // returns *(pool[+4] + round4(pool[+0xC])) - a slot in a ~16MB GPU-resource
+  // recycle ring (pool struct in r31). The pool's producer index pool[+0x3C]
+  // never advances past the consumer index pool[+0xC]; nothing ever posts a
+  // completion token, so the slot stays 0 and the thread yields forever.
+  {
     static thread_local uint32_t last_lr = 0;
     static thread_local uint64_t run = 0;
     uint32_t lr = static_cast<uint32_t>(ctx->lr);
     if (lr == last_lr) {
       ++run;
-      if (run == 300000 || (run > 300000 && (run % 2000000) == 0)) {
-        auto gv = [&](uint32_t a) {
-          return a ? xe::load_and_swap<uint32_t>(ctx->TranslateVirtual(a)) : 0u;
-        };
+      auto gv = [&](uint32_t a) {
+        return a ? xe::load_and_swap<uint32_t>(ctx->TranslateVirtual(a)) : 0u;
+      };
+      if (cvars::log_guest_yield_spin &&
+          (run == 300000 || (run > 300000 && (run % 2000000) == 0))) {
         uint32_t r31 = uint32_t(ctx->r[31]);
         uint32_t pbase = gv(r31 + 4);
         uint32_t poc = gv(r31 + 0xC);
@@ -549,6 +553,46 @@ dword_result_t NtYieldExecution_entry(const ppc_context_t& ctx) {
             "poll[{:08X}]={:08X}  (nothing posting to this ring -> wedge)",
             lr, run, r31, pbase, poc, gv(r31 + 0x3C), gv(r31 + 0x10), slot,
             gv(slot));
+      }
+      // The wedge is specifically lr=0x82CBD0A8 (the 0x82CBD098 yield helper).
+      // Fully traced: the readiness predicate 0x822A8E78 returns 0 - NOT the
+      // ring slot - because at 0x822A8EC0 it finds the *producer* index
+      // pool[+0x3C] (copied to pool[+0x10] by 0x822943E8) has not reached
+      // round4(pool[+0xC]) + 4. i.e. producer_idx == consumer_idx == ring empty,
+      // and nothing on this port ever advances pool[+0x3C]. The slot itself is
+      // already seeded (poll[slot] == 1). So: after a clearly-stuck run, step
+      // the producer index one entry (8 bytes) past the consumer index. The
+      // predicate then reads the (already non-zero) slot, the consumer dequeues
+      // one item, advances pool[+0xC] by 8, and loops for the next - which we
+      // feed again on the next wedge, draining the ring at ~1 entry/wedge until
+      // the real producer (if it ever unblocks) takes over.
+      if (cvars::break_fable2_resource_wedge && lr == 0x82CBD0A8u &&
+          run >= 400000 && (run % 100000) == 0) {
+        uint32_t r31 = uint32_t(ctx->r[31]);
+        uint32_t pbase = gv(r31 + 4);
+        if (r31 >= 0x40000000u && r31 < 0x50000000u && pbase >= 0x40000000u &&
+            pbase < 0x50000000u) {
+          uint32_t poc = gv(r31 + 0xC);
+          uint32_t prod = gv(r31 + 0x3C);
+          if (prod <= poc) {
+            uint32_t want = ((poc + 3) & ~3u) + 8;
+            xe::store_and_swap<uint32_t>(ctx->TranslateVirtual(r31 + 0x3C),
+                                         want);
+            // Make sure the slot the predicate is about to read is non-zero.
+            uint32_t slot = pbase + ((poc + 3) & ~3u);
+            uint8_t* hp = ctx->TranslateVirtual(slot);
+            if (xe::load_and_swap<uint32_t>(hp) == 0) {
+              xe::store_and_swap<uint32_t>(hp, 1u);
+            }
+            static std::atomic<uint32_t> warn{0};
+            if ((warn++ & 0x1F) == 0) {
+              XELOGW(
+                  "Fable II resource wedge: advanced producer index {:08X}->"
+                  "{:08X} (pool {:08X}, consumer {:08X}) after {} spins",
+                  prod, want, r31, poc, run);
+            }
+          }
+        }
       }
     } else {
       last_lr = lr;
