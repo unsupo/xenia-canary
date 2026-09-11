@@ -9,7 +9,10 @@
 
 #include "xenia/kernel/xobject.h"
 
+#include <cstdlib>
+
 #include "xenia/base/byte_stream.h"
+#include "xenia/base/logging.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
@@ -201,8 +204,31 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode,
                         TimeoutTicksToMs(*opt_timeout)))
                   : std::chrono::milliseconds::max();
 
+  // macos-arm64 Fable II bring-up: the loading screen after New Game ->
+  // character select sits indefinitely once reached, with only a steady
+  // per-audio-tick XMA register-write trickle in the log after that point -
+  // sample'd the process and found the Main XThread parked inside
+  // NtWaitForSingleObjectEx (i.e. here). Log every genuinely-infinite wait
+  // (opt_timeout == nullptr) with the object's type/handle/name so we can
+  // tell "the guest is legitimately blocked waiting for something that will
+  // eventually signal it" from "nothing will ever signal this" - gated by
+  // XE_LOG_WAIT since this is a real per-call log, not a periodic one.
+  if (!opt_timeout && std::getenv("XE_LOG_WAIT")) {
+    XELOGW(
+        "XObject::Wait: thread {:08X} blocking INDEFINITELY on type={} "
+        "handle={:08X} name='{}'",
+        XThread::GetCurrentThreadId(), uint32_t(type()), handle(), name());
+  }
+
   auto result =
       xe::threading::Wait(wait_handle, alertable ? true : false, timeout_ms);
+
+  if (!opt_timeout && std::getenv("XE_LOG_WAIT")) {
+    XELOGW(
+        "XObject::Wait: thread {:08X} woke from indefinite wait on "
+        "handle={:08X} name='{}' result={}",
+        XThread::GetCurrentThreadId(), handle(), name(), uint32_t(result));
+  }
 
   switch (result) {
     case xe::threading::WaitResult::kSuccess:
