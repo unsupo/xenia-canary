@@ -23,6 +23,9 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <atomic>
+#include <cstdio>
+#include <cstring>
+#include <execinfo.h>
 #endif
 
 #ifndef __APPLE__
@@ -449,6 +452,37 @@ static void DarwinExceptionHandlerCallback(int signal_number, siginfo_t* signal_
         return;
       }
     }
+  }
+#endif
+
+#ifdef __APPLE__
+  // macos-arm64 Fable II bring-up: none of the registered handlers claimed
+  // this fault, so it's about to terminate the process via the default
+  // signal disposition - which, in this sandboxed environment, generates no
+  // ~/Library/Logs/DiagnosticReports/*.ips (confirmed empirically: multiple
+  // reproductions of an ARM64 JIT crash left no crash report at all). A
+  // std::set_terminate hook (windowed_app_main_mac.mm) only catches uncaught
+  // C++ exceptions, not a raw SIGILL/SIGSEGV/SIGBUS like this, so that
+  // wouldn't have fired either. backtrace()/backtrace_symbols() are not
+  // strictly async-signal-safe, but the process is already unrecoverable
+  // here - a best-effort dump beats losing the only diagnostic evidence
+  // this environment produces for a fatal signal.
+  {
+    char header[192];
+    int header_len =
+        snprintf(header, sizeof(header),
+                 "\n=== FableII-CRASH-TRACE: unhandled signal %d (%s) at "
+                 "pc=0x%llx fault_addr=%p ===\n",
+                 signal_number, strsignal(signal_number),
+                 static_cast<unsigned long long>(mc->__ss.__pc),
+                 signal_info->si_addr);
+    if (header_len > 0) {
+      ssize_t w = write(STDERR_FILENO, header, size_t(header_len));
+      (void)w;
+    }
+    void* frames[128];
+    int frame_count = backtrace(frames, 128);
+    backtrace_symbols_fd(frames, frame_count, STDERR_FILENO);
   }
 #endif
 
