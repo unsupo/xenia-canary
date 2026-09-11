@@ -618,14 +618,20 @@ uint32_t xeKeSetEvent(X_KEVENT* event_ptr, uint32_t increment, uint32_t wait) {
   if (!event_ptr) {
     return 0;
   }
-  uint32_t guest_addr = kernel_state()->memory()->HostToGuestVirtual(event_ptr);
-  if (guest_addr == 0xF80000CC || (reinterpret_cast<uintptr_t>(event_ptr) & 0xFFFFFFFF) == 0xF80000CC) {
-    XELOGI("!!! KeSetEvent TARGET EVENT MATCH !!! event_ptr={:08X}, increment={}, wait={}", guest_addr, increment, wait);
-  }
+  // macos-arm64 Fable II bring-up: this used to unconditionally resolve
+  // guest_addr and compare it against a specific target address on every
+  // single call (KeSetEvent is one of the hottest kernel sync primitives -
+  // called continuously by every semaphore/event signal in the game). That
+  // diagnostic served its purpose during the resource-completion livelock
+  // investigation (see XE_EVENT_WRITE_INTERRUPT / CACHE_FLUSH_TS in
+  // pm4_command_processor_implement.h, now the real fix) and is retired;
+  // guest_addr is now only computed lazily on the rare NULL-object error
+  // path below.
   auto ev = XObject::GetNativeObject<XEvent>(kernel_state(), event_ptr,
                                              event_ptr->header.type);
   if (!ev) {
-    XELOGW("xeKeSetEvent: NULL object for event_ptr={:08X}", guest_addr);
+    XELOGW("xeKeSetEvent: NULL object for event_ptr={:08X}",
+           kernel_state()->memory()->HostToGuestVirtual(event_ptr));
     assert_always();
     return 0;
   }

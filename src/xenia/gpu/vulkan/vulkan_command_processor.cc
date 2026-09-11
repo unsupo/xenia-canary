@@ -1776,7 +1776,20 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
     XELOGE("ISSUESWAP: RequestSwapTexture returned VK_NULL_HANDLE for fb_ptr=0x{:08X}", frontbuffer_ptr);
     return;
   }
-  XELOGI("ISSUESWAP: RequestSwapTexture SUCCEEDED for fb_ptr=0x{:08X}, calling RefreshGuestOutput", frontbuffer_ptr);
+  // macos-arm64 Fable II bring-up: this used to XELOGI unconditionally on
+  // every single successful swap (i.e. every presented frame, forever) -
+  // real per-frame formatting+I/O overhead left over from bring-up tracing.
+  // Gated behind the same XE_LOG_SWAP flag as the ISSUESWAP-TRACE block
+  // above so it's still available on demand.
+  {
+    static const bool log_swap = std::getenv("XE_LOG_SWAP") != nullptr;
+    if (log_swap) {
+      XELOGI(
+          "ISSUESWAP: RequestSwapTexture SUCCEEDED for fb_ptr=0x{:08X}, "
+          "calling RefreshGuestOutput",
+          frontbuffer_ptr);
+    }
+  }
 
   auto aspect = graphics_system_->GetScaledAspectRatio();
 

@@ -340,8 +340,17 @@ void CommandProcessor::RequestSwapAfterRingDrain(
     uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
     uint32_t frontbuffer_height,
     const xenos::xe_gpu_texture_fetch_t& swap_fetch) {
-  XELOGI("DEFERRED-SWAP-REQ fb_ptr=0x{:08X} {}x{}", frontbuffer_ptr,
-         frontbuffer_width, frontbuffer_height);
+  // macos-arm64 Fable II bring-up: gated behind XE_LOG_SWAP (see
+  // vulkan_command_processor.cc's ISSUESWAP-TRACE) - this fires once per
+  // deferred swap request, i.e. roughly once per frame forever, so it needs
+  // to stay opt-in rather than unconditional.
+  {
+    static const bool log_swap = std::getenv("XE_LOG_SWAP") != nullptr;
+    if (log_swap) {
+      XELOGI("DEFERRED-SWAP-REQ fb_ptr=0x{:08X} {}x{}", frontbuffer_ptr,
+             frontbuffer_width, frontbuffer_height);
+    }
+  }
   deferred_swap_frontbuffer_ptr_ = frontbuffer_ptr;
   deferred_swap_frontbuffer_width_ = frontbuffer_width;
   deferred_swap_frontbuffer_height_ = frontbuffer_height;
@@ -372,9 +381,15 @@ void CommandProcessor::WorkerThreadMain() {
     uint32_t write_ptr_index = write_ptr_index_.load();
     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
       if (deferred_swap_pending_.exchange(false, std::memory_order_acquire)) {
-        XELOGI("DEFERRED-SWAP-EXEC fb_ptr=0x{:08X} {}x{}",
-               deferred_swap_frontbuffer_ptr_, deferred_swap_frontbuffer_width_,
-               deferred_swap_frontbuffer_height_);
+        {
+          static const bool log_swap = std::getenv("XE_LOG_SWAP") != nullptr;
+          if (log_swap) {
+            XELOGI("DEFERRED-SWAP-EXEC fb_ptr=0x{:08X} {}x{}",
+                   deferred_swap_frontbuffer_ptr_,
+                   deferred_swap_frontbuffer_width_,
+                   deferred_swap_frontbuffer_height_);
+          }
+        }
         register_file_->SetTextureFetch(0, deferred_swap_fetch_);
         IssueSwap(deferred_swap_frontbuffer_ptr_, deferred_swap_frontbuffer_width_,
                   deferred_swap_frontbuffer_height_);
