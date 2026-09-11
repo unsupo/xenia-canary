@@ -10,6 +10,9 @@
 #import <Cocoa/Cocoa.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cxxabi.h>
+#include <execinfo.h>
+#include <exception>
 #include <memory>
 #include <thread>
 
@@ -79,7 +82,40 @@ void MacWindowedAppContext::PlatformQuitFromUIThread() {
 }  // namespace ui
 }  // namespace xe
 
+// macos-arm64 Fable II bring-up: capture the backtrace of an uncaught C++
+// exception (specifically Xbyak_aarch64::Error - the ARM64 JIT assembler
+// throws this when asked to emit an instruction with an illegal immediate)
+// before libc++abi's default terminate handler prints its one-line summary
+// and aborts with no useful stack. Attaching lldb to catch this in the act
+// was tried first and abandoned - the debugger's Mach-exception interception
+// of the (normally instantaneous, self-healing) guard-page commit fault on
+// the 3D Engine thread turns that into a slow stop/continue round-trip that
+// fires hundreds of times per second, starving the run of any chance to
+// reach the real crash. This handler has zero overhead until the moment
+// something actually throws, so it doesn't perturb that timing at all.
+static void FableIIUncaughtExceptionBacktraceHandler() {
+  fprintf(stderr, "\n=== FableII-CRASH-TRACE: uncaught C++ exception ===\n");
+  if (auto eptr = std::current_exception()) {
+    try {
+      std::rethrow_exception(eptr);
+    } catch (const std::exception& e) {
+      fprintf(stderr, "what(): %s\n", e.what());
+    } catch (...) {
+      fprintf(stderr, "what(): <non-std::exception type>\n");
+    }
+  }
+  void* frames[128];
+  int frame_count = backtrace(frames, 128);
+  char** symbols = backtrace_symbols(frames, frame_count);
+  for (int i = 0; i < frame_count; ++i) {
+    fprintf(stderr, "  [%2d] %s\n", i, symbols ? symbols[i] : "?");
+  }
+  fflush(stderr);
+  std::abort();
+}
+
 int main(int argc, char** argv) {
+  std::set_terminate(FableIIUncaughtExceptionBacktraceHandler);
   int result = EXIT_SUCCESS;
 
   @autoreleasepool {
