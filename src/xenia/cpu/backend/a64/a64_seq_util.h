@@ -137,6 +137,37 @@ constexpr bool IsFmov64Imm(double f64) {
   return true;
 }
 
+// macos-arm64 Fable II bring-up: CBZ/CBNZ only encode a 19-bit signed
+// word-offset immediate (+/-1 MiB reach), same as B.cond - unlike plain
+// unconditional B, which reaches +/-128 MiB. Guest OPCODE_BRANCH_TRUE/
+// OPCODE_BRANCH_FALSE emit cbz/cbnz straight to a HIR-block Label whose
+// final address isn't known until the whole function is assembled; in an
+// unusually large guest function (common enough to matter after
+// kMaxCodeSize was raised from 1 MiB to 4 MiB to fix a different overflow)
+// the target can end up further than +/-1 MiB away, and
+// Xbyak_aarch64::LabelManager::define_inner throws Error("label is too
+// far") when it tries to backpatch the immediate. Route every guest
+// conditional branch through the classic branch-island pattern instead of
+// emitting cbz/cbnz directly to a label that might resolve far away:
+// invert the condition, branch over a single unconditional B (which always
+// reaches), and land on a same-cached-label skip point immediately after -
+// the short conditional branch is then always just one instruction away,
+// unconditionally in range, regardless of how far the real target ends up.
+template <typename Reg>
+inline void SafeCbz(A64Emitter& e, const Reg& rt, Xbyak_aarch64::Label& target) {
+  auto& skip = e.NewCachedLabel();
+  e.cbnz(rt, skip);
+  e.b(target);
+  e.L(skip);
+}
+template <typename Reg>
+inline void SafeCbnz(A64Emitter& e, const Reg& rt, Xbyak_aarch64::Label& target) {
+  auto& skip = e.NewCachedLabel();
+  e.cbz(rt, skip);
+  e.b(target);
+  e.L(skip);
+}
+
 // Load a compile-time vec128_t constant into a NEON register.
 // May clobber the provided GPR scratch-register
 inline void LoadV128Const(A64Emitter& e, int vreg_idx, const vec128_t& val,
