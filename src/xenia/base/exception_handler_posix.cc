@@ -504,6 +504,47 @@ static void DarwinExceptionHandlerCallback(int signal_number, siginfo_t* signal_
       ssize_t w = write(STDERR_FILENO, regs, size_t(regs_len));
       (void)w;
     }
+    // Dump the raw machine code around lr - the actual compiled
+    // instructions of whichever guest function called into the crashing
+    // branch. x9==pc confirms this is a `br x9`-style indirect jump; lr
+    // tells us where the call/branch that led here lives, but not what it
+    // looks like. 64 bytes (16 instructions) centered ~32 bytes before lr
+    // covers the call site and a few instructions of context around it.
+    // Best-effort - vm_read guards against the range itself being unmapped.
+    {
+      char hdr2[64];
+      int hdr2_len = snprintf(hdr2, sizeof(hdr2), "code @ lr-32..lr+32:\n");
+      if (hdr2_len > 0) {
+        ssize_t w = write(STDERR_FILENO, hdr2, size_t(hdr2_len));
+        (void)w;
+      }
+      vm_address_t dump_start =
+          static_cast<vm_address_t>(mc->__ss.__lr) - 32;
+      vm_offset_t data_out = 0;
+      mach_msg_type_number_t count = 0;
+      if (vm_read(mach_task_self(), dump_start, 64, &data_out, &count) ==
+              KERN_SUCCESS &&
+          count >= 64) {
+        const uint32_t* words = reinterpret_cast<const uint32_t*>(data_out);
+        for (int i = 0; i < 16; ++i) {
+          char line[64];
+          int line_len =
+              snprintf(line, sizeof(line), "  [lr%+d] 0x%llx: %08x\n",
+                       (i * 4) - 32,
+                       static_cast<unsigned long long>(dump_start + i * 4),
+                       words[i]);
+          if (line_len > 0) {
+            ssize_t w = write(STDERR_FILENO, line, size_t(line_len));
+            (void)w;
+          }
+        }
+        vm_deallocate(mach_task_self(), data_out, count);
+      } else {
+        const char* fail = "  (vm_read failed - range unmapped)\n";
+        ssize_t w = write(STDERR_FILENO, fail, strlen(fail));
+        (void)w;
+      }
+    }
 #endif
     void* frames[128];
     int frame_count = backtrace(frames, 128);
