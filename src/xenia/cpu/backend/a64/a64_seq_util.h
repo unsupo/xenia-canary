@@ -167,6 +167,26 @@ inline void SafeCbnz(A64Emitter& e, const Reg& rt, Xbyak_aarch64::Label& target)
   e.b(target);
   e.L(skip);
 }
+// macos-arm64 Fable II bring-up: same "too far" failure mode, different
+// instruction - B.cond (used by e.b(Cond, Label)) has the identical 19-bit/
+// +-1 MiB reach as CBZ/CBNZ, and PushStackpoint/EnsureSynchronizedGuestAndHostStack
+// (a64_emitter.cc) each emit one straight to an AddToTail-deferred label,
+// which is placed at the *end* of the function - so in a large function the
+// distance from a mid-body branch to its own tail can exceed 1 MiB just as
+// easily as an HIR-block-to-HIR-block branch can. Same fix, generalized to
+// any condition: ARM64 condition codes 0x0-0xd invert by flipping the low
+// bit (EQ<->NE, GE<->LT, etc.) - AL/NV (0xe/0xf) have no meaningful inverse
+// and are never used for a real conditional branch, so they're not handled.
+inline Xbyak_aarch64::Cond InvertCond(Xbyak_aarch64::Cond cond) {
+  return static_cast<Xbyak_aarch64::Cond>(static_cast<int>(cond) ^ 1);
+}
+inline void SafeCondB(A64Emitter& e, Xbyak_aarch64::Cond cond,
+                      Xbyak_aarch64::Label& target) {
+  auto& skip = e.NewCachedLabel();
+  e.b(InvertCond(cond), skip);
+  e.b(target);
+  e.L(skip);
+}
 
 // Load a compile-time vec128_t constant into a NEON register.
 // May clobber the provided GPR scratch-register

@@ -574,7 +574,18 @@ void A64Emitter::PushStackpoint() {
     e.CallNativeSafe(
         reinterpret_cast<void*>(A64Emitter::HandleStackpointOverflowError));
   });
-  b(GE, overflow_label);
+  // macos-arm64 Fable II bring-up: overflow_label lives at the function's
+  // tail (AddToTail), which can be more than +/-1 MiB from this branch in a
+  // large function - B.cond's 19-bit immediate can't reach that far
+  // (Xbyak_aarch64::Error "label is too far"). Branch-island: invert the
+  // condition (GE -> LT), branch over an unconditional B (which reaches
+  // +/-128 MiB) to a same-cached-label skip point one instruction later.
+  {
+    auto& skip = NewCachedLabel();
+    b(LT, skip);
+    b(overflow_label);
+    L(skip);
+  }
 
   // Compute offset into array: x10 = w9 * sizeof(A64BackendStackpoint)
   mov(w10, static_cast<uint32_t>(sizeof(A64BackendStackpoint)));
@@ -640,7 +651,15 @@ void A64Emitter::EnsureSynchronizedGuestAndHostStack() {
                      e.backend()->synchronize_guest_and_host_stack_helper()));
     e.br(e.x10);
   });
-  b(NE, sync_label);
+  // macos-arm64 Fable II bring-up: same tail-distance risk as
+  // PushStackpoint's overflow_label above (NE -> EQ inverted) -
+  // sync_label is also AddToTail-deferred.
+  {
+    auto& skip = NewCachedLabel();
+    b(EQ, skip);
+    b(sync_label);
+    L(skip);
+  }
 
   L(return_from_sync);
 }
