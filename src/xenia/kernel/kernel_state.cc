@@ -1415,6 +1415,32 @@ void KernelState::EmulateCPInterruptDPC(uint32_t interrupt_callback,
     XELOGW("KernelState::EmulateCPInterruptDPC: interrupt_callback is NULL!");
     return;
   }
+  // macos-arm64 Fable II bring-up: guard against a stale interrupt_callback
+  // address. GraphicsSystem::interrupt_callback_ is set once by the guest
+  // (SetInterruptCallback) and can go stale across a scene/context
+  // transition (e.g. New Game -> character select -> loading, where the GPU
+  // context churns) if the CP fires an interrupt in the gap before the new
+  // scene re-registers its own ISR. Promoting XE_EVENT_WRITE_INTERRUPT to
+  // default-on (CACHE_FLUSH_TS) made this reachable in practice - crashed
+  // reproducibly with pc/fault_addr == 0x1010101010101010, a classic
+  // repeating-byte poison pattern for freed/reused memory, not a real guest
+  // code address (real XEX code addresses don't have all 4 bytes identical).
+  // Reject that pattern rather than executing into it; this is a heuristic
+  // safety net, not a fix for whatever leaves the callback stale.
+  {
+    uint32_t b0 = interrupt_callback & 0xFF;
+    bool looks_like_poison = ((interrupt_callback >> 8) & 0xFF) == b0 &&
+                             ((interrupt_callback >> 16) & 0xFF) == b0 &&
+                             ((interrupt_callback >> 24) & 0xFF) == b0;
+    if (looks_like_poison) {
+      XELOGW(
+          "KernelState::EmulateCPInterruptDPC: interrupt_callback={:08X} "
+          "looks like a poison/stale pattern, not a real guest address - "
+          "skipping dispatch instead of executing into it.",
+          interrupt_callback);
+      return;
+    }
+  }
 
   auto thread = kernel::XThread::GetCurrentThread();
   assert_not_null(thread);

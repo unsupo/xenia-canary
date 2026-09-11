@@ -235,8 +235,23 @@ inline void LoadV128Const(A64Emitter& e, int vreg_idx, const vec128_t& val,
   const uint64_t splat_u64 = val.u64[0];
   const double splat_f64 = val.f64[0];
   if (all_equal_u64) {
+    // macos-arm64 Fable II bring-up: TryMovi64Imm's imm8 out-param is its own
+    // *compressed* per-byte representative-bit mask (used by our all_equal_u8
+    // fast path above) - it is NOT what Xbyak_aarch64's movi(VReg2D&,
+    // uint64_t) wants. That overload (CodeGenerator::AdvSimdModiImmMoviMvniEnc)
+    // takes the RAW, uncompressed 64-bit constant and does its own internal
+    // compaction + validation (compactImm/isCompact - same per-byte-is-0x00-
+    // or-0xFF check TryMovi64Imm already did here). Passing the pre-
+    // compressed movi_imm byte as if it were the raw 64-bit value made
+    // Xbyak's internal re-compaction of that single byte fail its own
+    // sanity check for almost any value except exactly 0x00 or 0xFF,
+    // throwing Xbyak_aarch64::Error("illegal immediate parameter (condition
+    // error)") - intermittently, only when a guest function whose JIT
+    // compilation needed this exact constant-load path got compiled for the
+    // first time. Pass val.low (the raw value) instead; TryMovi64Imm is used
+    // here purely as the "is this value MOVI-2D-encodable" predicate.
     if (uint8_t movi_imm; TryMovi64Imm(val.low, movi_imm)) {
-      e.movi(VReg2D(vreg_idx), movi_imm);
+      e.movi(VReg2D(vreg_idx), val.low);
     } else if (IsFmov64Imm(splat_f64)) {
       e.fmov(VReg(vreg_idx).d2, splat_f64);
     } else {
