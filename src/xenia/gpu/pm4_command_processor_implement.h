@@ -1,5 +1,10 @@
 #pragma once
 
+#include <cstdlib>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
 #if !defined(NDEBUG)
 #define XE_ENABLE_PM4_DISASM 1
 #endif
@@ -270,14 +275,236 @@ void COMMAND_PROCESSOR::DisassembleCurrentPacket() XE_RESTRICT {
   }
   logger.submit('d');
 }
+// macos-arm64 Fable II bring-up: rolling log of the last N PM4 packet headers
+// (with the guest ring offset they were read from) so we can dump the exact
+// stream leading into a stale-IB / bad-packet failure. XE_LOG_WRM-gated dump.
+struct Pm4RecentEntry {
+  uint32_t ring_off;
+  uint32_t header;
+  uint32_t w1;
+  bool in_ib;
+};
+static thread_local Pm4RecentEntry g_pm4_recent[48] = {};
+static thread_local uint32_t g_pm4_recent_pos = 0;
+static thread_local bool g_pm4_in_ib = false;
+static void Pm4DumpRecent(const char* why) {
+  static const bool log_wrm = std::getenv("XE_LOG_WRM") != nullptr;
+  if (!log_wrm) return;
+  XELOGW("PM4-STREAM dump ({}): last 48 packets (oldest first)", why);
+  for (uint32_t i = 0; i < 48; ++i) {
+    const Pm4RecentEntry& e = g_pm4_recent[(g_pm4_recent_pos + i) % 48];
+    if (!e.header) continue;
+    uint32_t t = e.header >> 30;
+    uint32_t op3 = (e.header >> 8) & 0x7F;
+    uint32_t cnt = ((e.header >> 16) & 0x3FFF) + 1;
+    XELOGW("  [{}] off={:06X} hdr={:08X} type={} op={:02X} count={} w1={:08X}",
+           e.in_ib ? "IB" : "P ", e.ring_off, e.header, t, op3, cnt, e.w1);
+  }
+}
+
+// macos-arm64 Fable II bring-up, Phase 11/12: IB backing-memory identity/
+// lifetime diagnostic (XE_IM_LOAD_LIFECYCLE env-gated). Phase 10 found that
+// waiting longer before an IM_LOAD_IMMEDIATE read made the known-corrupt
+// 285-dword vertex shader WORSE, not better - ruling out a plain "producer
+// hasn't finished writing yet" latency race. Phase 11's settle check (re-read
+// the same bytes 300us/1300us after LoadShader already consumed them) found
+// 0/3636 changes - so it's not a live torn read at load time either; by the
+// time xenia reads it, the content is already stable. Phase 11 also found no
+// corrupt hash ever equals a confirmed-good hash seen elsewhere, ruling out
+// simple whole-buffer aliasing (reading someone else's complete valid
+// shader). What's left: does the SAME guest address hold different content
+// across separate dispatches, and how far apart (in load order) are those
+// dispatches? Phase 11's 8-slot LRU was too small to catch this - addresses
+// climb in large strides through what looks like a big linear pool, so
+// repeats are separated by hundreds of other loads. This version tracks
+// every distinct address for the life of the run instead.
+struct Pm4ImLoadImmAddrEntry {
+  uint64_t first_seq = 0;
+  uint64_t first_hash = 0;
+  uint64_t last_seq = 0;
+  uint64_t last_hash = 0;
+  uint32_t observe_count = 0;
+};
+static thread_local std::unordered_map<uint32_t, Pm4ImLoadImmAddrEntry>
+    g_im_load_imm_addr_hist;
+// Global hash->first-address registry: if a "corrupt" hash matches content
+// xenia already loaded from a DIFFERENT address, that's a byte-for-byte
+// stale/aliased read, not scrambled bytes.
+static thread_local std::unordered_map<uint64_t, uint32_t>
+    g_im_load_imm_hash_first_addr;
+static thread_local uint64_t g_im_load_imm_seq = 0;
+static thread_local uint32_t g_im_load_imm_prev_addr = 0;
+static thread_local bool g_im_load_imm_has_prev_addr = false;
+
+static void Pm4ImLoadImmDiagnose(uint32_t guest_addr, uint32_t ring_off,
+                                  bool in_ib, uint32_t size_dwords,
+                                  const std::vector<uint32_t>& snap0,
+                                  const uint32_t* host_words, uint64_t hash) {
+  uint64_t seq = g_im_load_imm_seq++;
+  int64_t addr_delta =
+      g_im_load_imm_has_prev_addr
+          ? int64_t(guest_addr) - int64_t(g_im_load_imm_prev_addr)
+          : 0;
+  g_im_load_imm_prev_addr = guest_addr;
+  g_im_load_imm_has_prev_addr = true;
+
+  // Per-address history: has xenia loaded from this exact address before,
+  // and did the content change since then?
+  auto it = g_im_load_imm_addr_hist.find(guest_addr);
+  if (it == g_im_load_imm_addr_hist.end()) {
+    XELOGW(
+        "IM_LOAD-LIFECYCLE seq={} addr={:08X} addr_delta={} {} "
+        "ring_off={:06X} hash={:016X} first observed load at this address "
+        "({} dwords)",
+        seq, guest_addr, addr_delta, in_ib ? "IB" : "P ", ring_off, hash,
+        size_dwords);
+    Pm4ImLoadImmAddrEntry e;
+    e.first_seq = e.last_seq = seq;
+    e.first_hash = e.last_hash = hash;
+    e.observe_count = 1;
+    g_im_load_imm_addr_hist.emplace(guest_addr, e);
+  } else {
+    Pm4ImLoadImmAddrEntry& e = it->second;
+    uint64_t seq_delta = seq - e.last_seq;
+    if (hash != e.last_hash) {
+      XELOGW(
+          "IM_LOAD-LIFECYCLE seq={} addr={:08X} addr_delta={} {} "
+          "ring_off={:06X} CONTENT CHANGED vs seq={} ({} loads ago, first "
+          "seen seq={}): prev_hash={:016X} now_hash={:016X} first_hash_ever="
+          "{:016X} observe_count={}",
+          seq, guest_addr, addr_delta, in_ib ? "IB" : "P ", ring_off,
+          e.last_seq, seq_delta, e.first_seq, e.last_hash, hash,
+          e.first_hash, e.observe_count + 1);
+    } else {
+      XELOGW(
+          "IM_LOAD-LIFECYCLE seq={} addr={:08X} addr_delta={} {} "
+          "ring_off={:06X} hash={:016X} content IDENTICAL to seq={} ({} "
+          "loads ago, observe_count={})",
+          seq, guest_addr, addr_delta, in_ib ? "IB" : "P ", ring_off, hash,
+          e.last_seq, seq_delta, e.observe_count + 1);
+    }
+    e.last_seq = seq;
+    e.last_hash = hash;
+    ++e.observe_count;
+  }
+
+  // Global hash registry: does this content match a payload xenia already
+  // saw at a *different* address?
+  auto hit = g_im_load_imm_hash_first_addr.find(hash);
+  if (hit != g_im_load_imm_hash_first_addr.end() &&
+      hit->second != guest_addr) {
+    XELOGW(
+        "IM_LOAD-LIFECYCLE seq={} addr={:08X} hash={:016X} ALIASES content "
+        "first seen at addr={:08X} - byte-for-byte copy of a payload xenia "
+        "already loaded from a different address",
+        seq, guest_addr, hash, hit->second);
+  } else if (hit == g_im_load_imm_hash_first_addr.end()) {
+    g_im_load_imm_hash_first_addr.emplace(hash, guest_addr);
+  }
+
+  // Settle check (kept from Phase 11 - already gave a clean 0/3636 negative
+  // result, keep monitoring it as the lifecycle table grows): re-read the
+  // identical bytes ~300us/~1300us after LoadShader already consumed them.
+  uint32_t settle_first_diff = UINT32_MAX;
+  bool settle_changed_300us = false, settle_changed_1300us = false;
+  xe::threading::Sleep(std::chrono::microseconds(300));
+  for (uint32_t i = 0; i < size_dwords; ++i) {
+    if (xe::load_and_swap<uint32_t>(host_words + i) != snap0[i]) {
+      settle_changed_300us = true;
+      if (settle_first_diff == UINT32_MAX) settle_first_diff = i;
+    }
+  }
+  xe::threading::Sleep(std::chrono::microseconds(1000));
+  for (uint32_t i = 0; i < size_dwords; ++i) {
+    if (xe::load_and_swap<uint32_t>(host_words + i) != snap0[i]) {
+      settle_changed_1300us = true;
+      if (settle_first_diff == UINT32_MAX) settle_first_diff = i;
+    }
+  }
+  if (settle_changed_300us || settle_changed_1300us) {
+    XELOGW(
+        "IM_LOAD-LIFECYCLE seq={} addr={:08X} hash={:016X} STILL BEING "
+        "WRITTEN after load: changed@+300us={} changed@+1300us={} "
+        "first_diff_dword={} - guest wrote to this address AFTER xenia "
+        "already loaded from it",
+        seq, guest_addr, hash, settle_changed_300us, settle_changed_1300us,
+        settle_first_diff);
+  }
+}
+
+// macos-arm64 Fable II bring-up, Phase 18: on-demand shader dump - given a
+// target hash via XE_DUMP_SHADER_HASH (hex, no 0x prefix), dump the full
+// ucode + every texture_binding's fetch_constant/dimension/predication the
+// first time a vertex or pixel shader with that hash becomes active. Built
+// to resolve the Phase 17 question: does the rect-list blit draw's pixel
+// shader really expect a live texture at fetch constant slot 0 on every
+// code path, or is that tfetch conditional/context-dependent in a way that
+// would mean the "clobbered" register isn't actually read on that pass.
+// Keyed on hash, valued on the last-seen texture_bindings().size() - dump
+// again whenever that count changes (e.g. 0 pre-analysis -> N post-analysis)
+// instead of only once ever, since the first occurrence of a freshly-loaded
+// shader may be queried before ucode analysis has populated its bindings.
+static thread_local std::unordered_map<uint64_t, size_t> g_dumped_shader_hashes;
+static void Pm4DumpShaderIfTargeted(Shader* shader, const char* label) {
+  if (!shader) return;
+  static const char* target_hex = std::getenv("XE_DUMP_SHADER_HASH");
+  if (!target_hex) return;
+  uint64_t target = strtoull(target_hex, nullptr, 16);
+  uint64_t hash = shader->ucode_data_hash();
+  if (hash != target) return;
+  size_t binding_count = shader->texture_bindings().size();
+  auto it = g_dumped_shader_hashes.find(hash);
+  if (it != g_dumped_shader_hashes.end() && it->second == binding_count) {
+    return;  // Already dumped this hash at this binding count.
+  }
+  g_dumped_shader_hashes[hash] = binding_count;
+
+  const auto& uc = shader->ucode_data();
+  XELOGW("SHADER-DUMP ({}) hash={:016X} type={} dwords={}", label, hash,
+         uint32_t(shader->type()), uc.size());
+  for (size_t i = 0; i < uc.size(); i += 8) {
+    size_t n = std::min<size_t>(size_t(8), uc.size() - i);
+    std::string line;
+    for (size_t j = 0; j < n; ++j) {
+      line += fmt::format("{:08X} ", uc[i + j]);
+    }
+    XELOGW("  [{:04X}] {}", i, line);
+  }
+  XELOGW("SHADER-DUMP ({}) hash={:016X} {} texture binding(s):", label, hash,
+         shader->texture_bindings().size());
+  for (const auto& binding : shader->texture_bindings()) {
+    const auto& fi = binding.fetch_instr;
+    XELOGW(
+        "  TEX-BINDING idx={} fetch_constant={} opcode={} dim={} "
+        "is_predicated={} predicate_condition={} result_write_mask={:#06b} "
+        "result_storage_target={}",
+        binding.binding_index, binding.fetch_constant,
+        fi.opcode_name ? fi.opcode_name : "?", uint32_t(fi.dimension),
+        fi.is_predicated, fi.predicate_condition,
+        fi.result.original_write_mask, uint32_t(fi.result.storage_target));
+  }
+}
+
 bool COMMAND_PROCESSOR::ExecutePacket() {
 #if XE_ENABLE_PM4_DISASM == 1
   if (cvars::disassemble_pm4 && logging::ShouldLog(LogLevel::Debug)) {
     COMMAND_PROCESSOR::DisassembleCurrentPacket();
   }
 #endif
+  uint32_t pkt_ring_off = uint32_t(reader_.read_offset());
   const uint32_t packet = reader_.ReadAndSwap<uint32_t>();
   const uint32_t packet_type = packet >> 30;
+  {
+    Pm4RecentEntry& e = g_pm4_recent[g_pm4_recent_pos];
+    e.ring_off = pkt_ring_off;
+    e.header = packet;
+    e.w1 = reader_.read_count() >= 4
+               ? xe::load_and_swap<uint32_t>(
+                     reinterpret_cast<const void*>(reader_.read_ptr()))
+               : 0;
+    e.in_ib = g_pm4_in_ib;
+    g_pm4_recent_pos = (g_pm4_recent_pos + 1) % 48;
+  }
 
   XE_LIKELY_IF(packet && packet != 0x0BADF00D) {
     XE_LIKELY_IF((packet != 0xCDCDCDCD)) {
@@ -325,6 +552,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType0_CountOverflow(uint32_t count) {
     XELOGE(
         "ExecutePacketType0 overflow (read count {:08X}, packet count {:08X})",
         COMMAND_PROCESSOR::GetCurrentRingReadCount(), count * sizeof(uint32_t));
+    Pm4DumpRecent("Type0 count overflow");
   }
   return false;
 }
@@ -356,6 +584,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType0(uint32_t packet) XE_RESTRICT {
             "PM4 Type0: base register {:X} past the register file - stale IB "
             "content, unwinding.",
             base_index);
+        Pm4DumpRecent("Type0 base register OOB");
       }
       return false;
     }
@@ -411,6 +640,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_CountOverflow(uint32_t count) {
     XELOGE(
         "ExecutePacketType3 overflow (read count {:08X}, packet count {:08X})",
         COMMAND_PROCESSOR::GetCurrentRingReadCount(), count * sizeof(uint32_t));
+    Pm4DumpRecent("Type3 count overflow");
   }
   return false;
 }
@@ -665,6 +895,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_INTERRUPT(
 
   // generate interrupt from the command stream
   uint32_t cpu_mask = reader_.ReadAndSwap<uint32_t>();
+  register_file_->values[XE_GPU_REG_CP_INT_STATUS] |= 1 | (cpu_mask << 8);
   for (int n = 0; n < 6; n++) {
     if (cpu_mask & (1 << n)) {
       graphics_system_->DispatchInterruptCallback(1, n);
@@ -729,10 +960,14 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_INDIRECT_BUFFER(
           "PM4 INDIRECT_BUFFER: skipping an implausible dispatch (ptr {:08X}, "
           "length {:05X}) - stale ring content.",
           cpu_ptr, list_length);
+      Pm4DumpRecent("implausible INDIRECT_BUFFER");
     }
     return true;
   }
+  bool prev_in_ib = g_pm4_in_ib;
+  g_pm4_in_ib = true;
   COMMAND_PROCESSOR::ExecuteIndirectBuffer(cpu_ptr, list_length);
+  g_pm4_in_ib = prev_in_ib;
   return true;
 }
 
@@ -767,6 +1002,28 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
 
   bool is_memory = (wait_info & 0x10) != 0;
   assert_true(is_memory || poll_reg_addr < RegisterFile::kRegisterCount);
+
+  {
+    static const bool log_wrm = std::getenv("XE_LOG_WRM") != nullptr;
+    if (log_wrm) {
+      uint32_t fn = wait_info & 0x7;  // 0=always 1=< 2=<= 3=== 4=!= 5=>= 6=>
+      const char* fns[] = {"ALWAYS", "<", "<=", "==", "!=", ">=", ">", "?7"};
+      uint32_t cur = 0;
+      if (is_memory) {
+        cur = *reinterpret_cast<uint32_t*>(
+            memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)));
+        cur = xenos::GpuSwap(cur,
+                             static_cast<xenos::Endian>(poll_reg_addr & 0x3));
+      } else {
+        cur = register_file_->values[poll_reg_addr];
+      }
+      XELOGW(
+          "WRM-TRACE WAIT_REG_MEM space={} addr={:08X} ref={:08X} mask={:08X} "
+          "fn={} wait_info={:08X} | cur={:08X} (cur&mask={:08X})",
+          is_memory ? "MEM" : "REG", poll_reg_addr, ref, mask, fns[fn],
+          wait_info, cur, cur & mask);
+    }
+  }
 
   // macos-arm64 Fable II bring-up: an IB dispatched before its D3D producer
   // filled it is parsed as garbage, and the garbage words routinely decode to
@@ -929,7 +1186,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now().time_since_epoch())
                 .count());
-        if (now_ms - wrm_entry_ms > 1200) {
+        if (now_ms - wrm_entry_ms > 50) {
           uint32_t* slot = reinterpret_cast<uint32_t*>(
               memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)));
           *slot = xenos::GpuSwap(
@@ -982,9 +1239,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
           wrm_last_progress_counter_ = cnt;
           wrm_last_progress_ms_ = now_ms;
         }
-        // Abandon if no real batch for ~4s while stuck here, or this single
-        // call has spun far too long.
-        if (wrm_spins > 40000 || now_ms - wrm_last_progress_ms_ > 4000) {
+        // Abandon if no real batch for ~4s while stuck here.
+        if (now_ms - wrm_last_progress_ms_ > 4000) {
           // Deadlocked. Do NOT proceed past the wait (downstream packets need
           // the token the guest never wrote - dereferencing it crashes). Just
           // abandon the pending ring to the write pointer so the CP idles;
@@ -1090,6 +1346,11 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_REG_TO_MEM(
   xe::store(memory_->TranslatePhysical(mem_addr), reg_val);
   trace_writer_.WriteMemoryWrite(CpuToGpu(mem_addr), 4);
 
+  static const bool log_wrm = std::getenv("XE_LOG_WRM") != nullptr;
+  if (log_wrm && mem_addr >= 0x1FC00000 && mem_addr < 0x1FE00000) {
+    XELOGW("WRM-TRACE REG_TO_MEM reg={:04X} -> mem={:08X} val={:08X}", reg_addr,
+           mem_addr, reg_val);
+  }
   return true;
 }
 XE_NOINLINE
@@ -1104,6 +1365,10 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_MEM_WRITE(
     write_data = GpuSwap(write_data, endianness);
     xe::store(memory_->TranslatePhysical(addr), write_data);
     trace_writer_.WriteMemoryWrite(CpuToGpu(addr), 4);
+    static const bool log_wrm = std::getenv("XE_LOG_WRM") != nullptr;
+    if (log_wrm && addr >= 0x1FC00000 && addr < 0x1FE00000) {
+      XELOGW("WRM-TRACE MEM_WRITE mem={:08X} val={:08X}", addr, write_data);
+    }
     write_addr += 4;
   }
 
@@ -1154,19 +1419,116 @@ XE_FORCEINLINE
 void COMMAND_PROCESSOR::WriteEventInitiator(uint32_t value) XE_RESTRICT {
   register_file_->values[XE_GPU_REG_VGT_EVENT_INITIATOR] = value;
 }
+static const char* GetEventTypeName(uint32_t event_type) {
+  switch (event_type) {
+    case xenos::Event::VS_DEALLOC: return "VS_DEALLOC(0)";
+    case xenos::Event::PS_DEALLOC: return "PS_DEALLOC(1)";
+    case xenos::Event::VS_DONE_TS: return "VS_DONE_TS(2)";
+    case xenos::Event::PS_DONE_TS: return "PS_DONE_TS(3)";
+    case xenos::Event::CACHE_FLUSH_TS: return "CACHE_FLUSH_TS(4)";
+    case xenos::Event::CONTEXT_DONE: return "CONTEXT_DONE(5)";
+    case xenos::Event::CACHE_FLUSH: return "CACHE_FLUSH(6)";
+    case xenos::Event::VIZQUERY_START: return "VIZQUERY_START(7)";
+    case xenos::Event::VIZQUERY_END: return "VIZQUERY_END(8)";
+    case xenos::Event::SC_WAIT_WC: return "SC_WAIT_WC(9)";
+    case xenos::Event::MPASS_PS_CP_REFETCH: return "MPASS_PS_CP_REFETCH(10)";
+    case xenos::Event::MPASS_PS_RST_START: return "MPASS_PS_RST_START(11)";
+    case xenos::Event::MPASS_PS_INCR_START: return "MPASS_PS_INCR_START(12)";
+    case xenos::Event::RST_PIX_CNT: return "RST_PIX_CNT(13)";
+    case xenos::Event::RST_VTX_CNT: return "RST_VTX_CNT(14)";
+    case xenos::Event::TILE_FLUSH: return "TILE_FLUSH(15)";
+    case xenos::Event::CACHE_FLUSH_AND_INV_TS_EVENT: return "CACHE_FLUSH_AND_INV_TS_EVENT(20)";
+    case xenos::Event::ZPASS_DONE: return "ZPASS_DONE(21)";
+    case xenos::Event::CACHE_FLUSH_AND_INV_EVENT: return "CACHE_FLUSH_AND_INV_EVENT(22)";
+    case xenos::Event::PERFCOUNTER_START: return "PERFCOUNTER_START(23)";
+    case xenos::Event::PERFCOUNTER_STOP: return "PERFCOUNTER_STOP(24)";
+    case xenos::Event::SCREEN_EXT_INIT: return "SCREEN_EXT_INIT(25)";
+    case xenos::Event::SCREEN_EXT_RPT: return "SCREEN_EXT_RPT(26)";
+    case xenos::Event::VS_FETCH_DONE_TS: return "VS_FETCH_DONE_TS(27)";
+    default: return "UNKNOWN";
+  }
+}
 bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE(
     uint32_t packet, uint32_t count) XE_RESTRICT {
   // generate an event that creates a write to memory when completed
   uint32_t initiator = reader_.ReadAndSwap<uint32_t>();
+  uint32_t event_type = initiator & 0x3f;
   // Writeback initiator.
-
-  COMMAND_PROCESSOR::WriteEventInitiator(initiator & 0x3f);
+  COMMAND_PROCESSOR::WriteEventInitiator(event_type);
+  static const bool log_wrm = std::getenv("XE_LOG_WRM") != nullptr;
   if (count == 1) {
     // Just an event flag? Where does this write?
+    if (log_wrm) {
+      XELOGW("WRM-TRACE EVENT_WRITE (flag-only) initiator={:08X} type={} ({})",
+             initiator, event_type, GetEventTypeName(event_type));
+    }
   } else {
-    // Write to an address.
-    assert_always();
-    reader_.AdvanceRead((count - 1) * sizeof(uint32_t));
+    // Timestamp / fence event: writes a value to a guest address when the CP
+    // reaches this packet (CACHE_FLUSH_AND_INV_TS etc.). Stock Xenia asserts
+    // and drops this - which is exactly the missing CP->CPU mailbox writeback
+    // Fable II's GPU pump polls (0x1FC800xx WAIT_REG_MEM standoff). Read the
+    // address + data and log; the actual write is done below.
+    uint32_t address = reader_.ReadAndSwap<uint32_t>();
+    uint32_t data_lo = 0;
+    bool have_data = count >= 3;
+    if (have_data) {
+      data_lo = reader_.ReadAndSwap<uint32_t>();
+    }
+    if (count >= 4) {
+      reader_.AdvanceRead((count - 3) * sizeof(uint32_t));  // data hi + extra
+    }
+    auto endianness = static_cast<xenos::Endian>(address & 0x3);
+    uint32_t aligned = address & ~uint32_t(0x3);
+    if (have_data) {
+      uint32_t swapped = xenos::GpuSwap(data_lo, endianness);
+      xe::store(memory_->TranslatePhysical(aligned), swapped);
+      trace_writer_.WriteMemoryWrite(CpuToGpu(aligned), 4);
+    }
+    if (log_wrm) {
+      XELOGW(
+          "WRM-TRACE EVENT_WRITE initiator={:08X} type={} ({}) count={} -> addr={:08X} "
+          "data={:08X} have_data={} (endian={})",
+          initiator, event_type, GetEventTypeName(event_type), count, address, data_lo,
+          have_data, static_cast<int>(endianness));
+    }
+  }
+
+  // macos-arm64 Fable II bring-up, Phase 28: promoted to default. Real
+  // hardware's EVENT_WRITE writes memory AND interrupts the CPU so it
+  // doesn't have to poll; this only ever did the write half. Firing on
+  // *every* EVENT_WRITE broke boot (routine events like CACHE_FLUSH fire
+  // tens of thousands of times/run). CACHE_FLUSH_TS specifically fires
+  // exactly once in every captured trace this session and, gated to just
+  // that type, fixes the resource-completion livelock (verified live via
+  // lldb: consumer/producer indices were equal - ring fully drained,
+  // waiting on a write that never came) with no observed regression.
+  // XE_EVENT_WRITE_INTERRUPT overrides for diagnostics: "all"/"1"/"true"
+  // fires on every event type (known to break boot, kept for
+  // comparison), "0"/"none"/"false" disables entirely, a bare number
+  // fires only for that specific event type instead of CACHE_FLUSH_TS.
+  bool should_fire_interrupt = (event_type == xenos::Event::CACHE_FLUSH_TS);
+  if (const char* interrupt_env = std::getenv("XE_EVENT_WRITE_INTERRUPT")) {
+    if (std::strcmp(interrupt_env, "all") == 0 ||
+        std::strcmp(interrupt_env, "1") == 0 ||
+        std::strcmp(interrupt_env, "true") == 0) {
+      should_fire_interrupt = true;
+    } else if (std::strcmp(interrupt_env, "0") == 0 ||
+               std::strcmp(interrupt_env, "none") == 0 ||
+               std::strcmp(interrupt_env, "false") == 0) {
+      should_fire_interrupt = false;
+    } else {
+      char* endptr = nullptr;
+      long val = std::strtol(interrupt_env, &endptr, 0);
+      should_fire_interrupt =
+          (endptr != interrupt_env && val == static_cast<long>(event_type));
+    }
+  }
+  if (should_fire_interrupt && graphics_system_) {
+    if (log_wrm) {
+      XELOGW("WRM-TRACE EVENT_WRITE firing interrupt for type={} ({})",
+             event_type, GetEventTypeName(event_type));
+    }
+    graphics_system_->DispatchInterruptCallback(1, 2);
   }
   return true;
 }
@@ -1177,8 +1539,9 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_SHD(
   uint32_t initiator = reader_.ReadAndSwap<uint32_t>();
   uint32_t address = reader_.ReadAndSwap<uint32_t>();
   uint32_t value = reader_.ReadAndSwap<uint32_t>();
+  uint32_t event_type = initiator & 0x3F;
   // Writeback initiator.
-  COMMAND_PROCESSOR::WriteEventInitiator(initiator & 0x3F);
+  COMMAND_PROCESSOR::WriteEventInitiator(event_type);
   uint32_t data_value;
   if ((initiator >> 31) & 0x1) {
     // Write counter (GPU vblank counter?).
@@ -1188,14 +1551,14 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_SHD(
     data_value = value;
   }
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
-  address &= ~0x3;
-  data_value = GpuSwap(data_value, endianness);
-  uint8_t* write_destination = memory_->TranslatePhysical(address);
-  if (address > 0x1FFFFFFF) {
+  uint32_t aligned_address = address & ~0x3;
+  uint32_t swapped_data = GpuSwap(data_value, endianness);
+  uint8_t* write_destination = memory_->TranslatePhysical(aligned_address);
+  if (aligned_address > 0x1FFFFFFF) {
     uint32_t writeback_base =
         register_file_->values[XE_GPU_REG_WRITEBACK_START];
     uint32_t writeback_size = register_file_->values[XE_GPU_REG_WRITEBACK_SIZE];
-    uint32_t writeback_offset = address - writeback_base;
+    uint32_t writeback_offset = aligned_address - writeback_base;
     // check whether the guest has written writeback base. if they haven't, skip
     // the offset check
     if (writeback_base != 0 && writeback_offset < writeback_size) {
@@ -1203,8 +1566,46 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_SHD(
           memory_->TranslateVirtual(0x7F000000 + writeback_offset);
     }
   }
-  xe::store(write_destination, data_value);
-  trace_writer_.WriteMemoryWrite(CpuToGpu(address), 4);
+  xe::store(write_destination, swapped_data);
+  trace_writer_.WriteMemoryWrite(CpuToGpu(aligned_address), 4);
+
+  static const bool log_wrm = std::getenv("XE_LOG_WRM") != nullptr;
+  if (log_wrm) {
+    XELOGW(
+        "WRM-TRACE EVENT_WRITE_SHD initiator={:08X} type={} ({}) count={} -> addr={:08X} "
+        "data={:08X} (endian={})",
+        initiator, event_type, GetEventTypeName(event_type), count, address, data_value,
+        static_cast<int>(endianness));
+  }
+
+
+
+  // Phase 28: promoted to default - see the matching comment in
+  // ExecutePacketType3_EVENT_WRITE above.
+  bool should_fire_interrupt = (event_type == xenos::Event::CACHE_FLUSH_TS);
+  if (const char* interrupt_env = std::getenv("XE_EVENT_WRITE_INTERRUPT")) {
+    if (std::strcmp(interrupt_env, "all") == 0 ||
+        std::strcmp(interrupt_env, "1") == 0 ||
+        std::strcmp(interrupt_env, "true") == 0) {
+      should_fire_interrupt = true;
+    } else if (std::strcmp(interrupt_env, "0") == 0 ||
+               std::strcmp(interrupt_env, "none") == 0 ||
+               std::strcmp(interrupt_env, "false") == 0) {
+      should_fire_interrupt = false;
+    } else {
+      char* endptr = nullptr;
+      long val = std::strtol(interrupt_env, &endptr, 0);
+      should_fire_interrupt =
+          (endptr != interrupt_env && val == static_cast<long>(event_type));
+    }
+  }
+  if (should_fire_interrupt && graphics_system_) {
+    if (log_wrm) {
+      XELOGW("WRM-TRACE EVENT_WRITE_SHD firing interrupt for type={} ({})",
+             event_type, GetEventTypeName(event_type));
+    }
+    graphics_system_->DispatchInterruptCallback(1, 2);
+  }
   return true;
 }
 
@@ -1213,8 +1614,9 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_EXT(
   // generate a screen extent event
   uint32_t initiator = reader_.ReadAndSwap<uint32_t>();
   uint32_t address = reader_.ReadAndSwap<uint32_t>();
+  uint32_t event_type = initiator & 0x3F;
   // Writeback initiator.
-  COMMAND_PROCESSOR::WriteEventInitiator(initiator & 0x3F);
+  COMMAND_PROCESSOR::WriteEventInitiator(event_type);
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
   address &= ~0x3;
 
@@ -1241,6 +1643,11 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_EXT(
   }
 
   trace_writer_.WriteMemoryWrite(CpuToGpu(address), sizeof(extents));
+  static const bool log_wrm = std::getenv("XE_LOG_WRM") != nullptr;
+  if (log_wrm) {
+    XELOGW("WRM-TRACE PM4_EVENT_WRITE_EXT: initiator={:08X} type={} ({}) addr={:08X} endian={}",
+           initiator, event_type, GetEventTypeName(event_type), address, static_cast<int>(endianness));
+  }
   return true;
 }
 
@@ -1249,8 +1656,14 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_ZPD(
     uint32_t packet, uint32_t count) XE_RESTRICT {
   assert_true(count == 1);
   uint32_t initiator = reader_.ReadAndSwap<uint32_t>();
+  uint32_t event_type = initiator & 0x3F;
   // Writeback initiator.
-  COMMAND_PROCESSOR::WriteEventInitiator(initiator & 0x3F);
+  COMMAND_PROCESSOR::WriteEventInitiator(event_type);
+  static const bool log_wrm = std::getenv("XE_LOG_WRM") != nullptr;
+  if (log_wrm) {
+    XELOGW("WRM-TRACE PM4_EVENT_WRITE_ZPD: initiator={:08X} type={} ({})",
+           initiator, event_type, GetEventTypeName(event_type));
+  }
 
   uint32_t report_address =
       register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
@@ -1428,6 +1841,51 @@ bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
   if (draw_succeeded) {
     auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
     if (!(viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z)) {
+      // macos-arm64 Fable II bring-up, Phase 16: trace every draw's active
+      // vertex/pixel shader hashes + primitive info, to identify which draw
+      // is the Bink-video/logo quad by its shape (small index count, likely
+      // a full-screen or near-full-screen 4-vertex quad) rather than by
+      // guessing from PM4_IM_LOAD_IMMEDIATE timing, which Phase 15's visual
+      // A/B test showed doesn't actually explain the warped-text artifact.
+      static const bool log_draw = std::getenv("XE_LOG_DRAW") != nullptr;
+      if (log_draw) {
+        XELOGW(
+            "DRAW-TRACE prim_type={} num_indices={} indexed={} vs_hash={:016X}"
+            " ps_hash={:016X}",
+            uint32_t(vgt_draw_initiator.prim_type),
+            vgt_draw_initiator.num_indices, is_indexed,
+            active_vertex_shader_ ? active_vertex_shader_->ucode_data_hash()
+                                   : 0,
+            active_pixel_shader_ ? active_pixel_shader_->ucode_data_hash()
+                                 : 0);
+        // Phase 16 continued: for the specific rect-list (prim_type=8,
+        // num_indices=3) full-screen blit shape identified as the
+        // video/logo-compositing draw, dump every texture fetch constant the
+        // active pixel shader actually samples from - format/dimensions/
+        // address/tiled/endianness - to check whether the decoded Bink frame
+        // is already wrong (bad format, wrong dims, garbage address) before
+        // it ever reaches the shader, since no vertex/pixel shader involved
+        // in this draw has ever thrown a translation error.
+        if (vgt_draw_initiator.prim_type == xenos::PrimitiveType::kRectangleList &&
+            active_pixel_shader_) {
+          for (const auto& binding : active_pixel_shader_->texture_bindings()) {
+            xenos::xe_gpu_texture_fetch_t fetch =
+                register_file_->GetTextureFetch(binding.fetch_constant);
+            XELOGW(
+                "  TEX-FETCH slot={} type={} format={} dim={} w={} h={} "
+                "base_addr={:08X} pitch={} tiled={} endian={} raw=[{:08X} "
+                "{:08X} {:08X} {:08X} {:08X} {:08X}]",
+                binding.fetch_constant, uint32_t(fetch.type),
+                uint32_t(fetch.format), uint32_t(fetch.dimension),
+                fetch.size_2d.width + 1, fetch.size_2d.height + 1,
+                fetch.base_address << 12, fetch.pitch, fetch.tiled,
+                uint32_t(fetch.endianness), fetch.dword_0, fetch.dword_1,
+                fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);
+          }
+        }
+      }
+      Pm4DumpShaderIfTargeted(active_vertex_shader_, "vertex");
+      Pm4DumpShaderIfTargeted(active_pixel_shader_, "pixel");
       // TODO(Triang3l): Don't drop the draw call completely if the vertex
       // shader has memexport.
       // TODO(Triang3l || JoelLinn): Handle this properly in the render
@@ -1495,7 +1953,19 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_SET_CONSTANT(
       COMMAND_PROCESSOR::WriteALURangeFromRing(&reader_, index, countm1);
       break;
     case 1:  // FETCH
-
+      // macos-arm64 Fable II bring-up, Phase 19: identify which PM4
+      // mechanism is responsible for writes to fetch-constant slot 0's
+      // dwords (0-5) - SET_CONSTANT(FETCH), SET_CONSTANT2 ("INCR_UPDATE_
+      // STATE" per xenos.h - possibly a different state-update timing
+      // semantic xenia doesn't model), or LOAD_ALU_CONSTANT(FETCH), to
+      // narrow down the constant-resolution-timing hypothesis from Phase
+      // 17/18.
+      if (std::getenv("XE_LOG_FETCH0") && index <= 5 &&
+          index + countm1 >= 0) {
+        XELOGW("FETCH0-SRC via SET_CONSTANT(FETCH) index={} countm1={}",
+               index, countm1);
+        Pm4DumpRecent("SET_CONSTANT(FETCH) touching slot 0");
+      }
       COMMAND_PROCESSOR::WriteFetchRangeFromRing(&reader_, index, countm1);
 
       break;
@@ -1528,6 +1998,18 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_SET_CONSTANT2(
   uint32_t index = offset_type & 0xFFFF;
   uint32_t countm1 = count - 1;
 
+  // Phase 19: same check, for the raw-register "INCR_UPDATE_STATE" path -
+  // this writes ANY register directly (not typed ALU/FETCH/BOOL/LOOP), so
+  // check against the absolute fetch-constant-slot-0 register range
+  // (0x4800-0x4805) rather than a FETCH-relative index.
+  if (std::getenv("XE_LOG_FETCH0") && index <= 0x4805 &&
+      index + countm1 >= 0x4800) {
+    XELOGW("FETCH0-SRC via SET_CONSTANT2(INCR_UPDATE_STATE) index={:04X} "
+           "countm1={}",
+           index, countm1);
+    Pm4DumpRecent("SET_CONSTANT2 touching slot 0");
+  }
+
   COMMAND_PROCESSOR::WriteRegisterRangeFromRing(&reader_, index, countm1);
 
   return true;
@@ -1553,6 +2035,13 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_LOAD_ALU_CONSTANT(
 
       break;
     case 1:  // FETCH
+      if (std::getenv("XE_LOG_FETCH0") && index <= 5 &&
+          index + size_dwords >= 0) {
+        XELOGW("FETCH0-SRC via LOAD_ALU_CONSTANT(FETCH) index={} "
+               "size_dwords={} addr={:08X}",
+               index, size_dwords, address);
+        Pm4DumpRecent("LOAD_ALU_CONSTANT(FETCH) touching slot 0");
+      }
       trace_writer_.WriteMemoryRead(CpuToGpu(address), size_dwords * 4);
       COMMAND_PROCESSOR::WriteFetchRangeFromMem(index, xlat_address,
                                                 size_dwords);
@@ -1609,9 +2098,33 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_IM_LOAD(uint32_t packet,
   uint32_t size_dwords = start_size & 0xFFFF;  // dwords
   assert_true(start == 0);
   trace_writer_.WriteMemoryRead(CpuToGpu(addr), size_dwords * 4);
+  // macos-arm64 Fable II bring-up diagnostic: PHASE 9 - prove/disprove the CP
+  // outrunning the guest's shader-microcode producer. IM_LOAD reads guest
+  // memory the instant this packet executes; if the producer (another guest
+  // thread, or the same thread a few stores earlier) hasn't finished writing
+  // size_dwords worth of microcode yet, LoadShader hashes a partially-written
+  // buffer - which is exactly what Phase 8 found (same header/size, different
+  // hash every load). XE_IM_LOAD_DELAY_US (microseconds) stalls right here,
+  // before the read, giving the producer a window to finish. Off by default;
+  // this is a diagnostic, not a fix - a real fix needs the guest's actual
+  // completion signal, not a fixed guess.
+  if (uint32_t delay_us = []() -> uint32_t {
+        static const uint32_t v = [] {
+          const char* e = std::getenv("XE_IM_LOAD_DELAY_US");
+          return e ? uint32_t(std::atoi(e)) : 0u;
+        }();
+        return v;
+      }()) {
+    xe::threading::Sleep(std::chrono::microseconds(delay_us));
+  }
   auto shader = COMMAND_PROCESSOR::LoadShader(
       shader_type, addr, memory_->TranslatePhysical<uint32_t*>(addr),
       size_dwords);
+  static const bool log_wrm_imload = std::getenv("XE_LOG_WRM") != nullptr;
+  if (log_wrm_imload && shader_type == xenos::ShaderType::kVertex) {
+    XELOGW("IM_LOAD-TRACE vertex addr={:08X} dwords={} hash={:016X}", addr,
+           size_dwords, shader->ucode_data_hash());
+  }
   switch (shader_type) {
     case xenos::ShaderType::kVertex:
       active_vertex_shader_ = shader;
@@ -1640,9 +2153,75 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_IM_LOAD_IMMEDIATE(
   assert_true(start == 0);
   assert_true(reader_.read_count() >= size_dwords * 4);
   assert_true(count - 2 >= size_dwords);
+  // macos-arm64 Fable II bring-up, Phase 10 correction: this shader is
+  // embedded directly in the command stream, but that does NOT mean it can't
+  // race the guest - "the IB dispatch was published" only proves the guest
+  // finished writing the ring/IB *header*; it says nothing about whether the
+  // guest CPU thread had actually finished stamping this specific packet's
+  // payload bytes into that same buffer region before xenia's CP, running at
+  // a different relative pace than real hardware, got there. Reuse
+  // XE_IM_LOAD_DELAY_US here too (same knob as PM4_IM_LOAD) to test that:
+  // trace evidence shows this exact 285-dword shader (E0544009... header)
+  // hashes differently almost every load, with a different "SHADER-OP
+  // unknown" opcode each time - the signature of a torn read, not a stable
+  // unsupported instruction - and the prior Phase 9 delay experiment never
+  // actually covered this path, since that shader is delivered via
+  // IM_LOAD_IMMEDIATE, not IM_LOAD.
+  if (uint32_t delay_us = []() -> uint32_t {
+        static const uint32_t v = [] {
+          const char* e = std::getenv("XE_IM_LOAD_DELAY_US");
+          return e ? uint32_t(std::atoi(e)) : 0u;
+        }();
+        return v;
+      }()) {
+    xe::threading::Sleep(std::chrono::microseconds(delay_us));
+  }
+  // Log where in the buffer this load sits (ring_off/in_ib line up with the
+  // PM4-STREAM dump's [P ]/[IB] entries) plus the hash, so a later
+  // "SHADER-OP unknown ... hash=X" can be matched back to exactly which
+  // buffer and offset it came from, and Pm4DumpRecent's rolling log shows
+  // what was executed immediately before it.
+  static const bool log_wrm_immediate = std::getenv("XE_LOG_WRM") != nullptr;
+  uint32_t im_load_immediate_ring_off = uint32_t(reader_.read_offset());
+  // Phase 11: snapshot the payload bytes (and the guest address they live
+  // at) BEFORE LoadShader consumes them, so Pm4ImLoadImmDiagnose can diff
+  // this observation against the last time this exact address was loaded,
+  // and re-check the same bytes shortly after the load "completes" to catch
+  // the guest still writing them. Gated to the known-corrupting shape
+  // (vertex, 285 dwords) to bound overhead - opt-in via XE_IM_LOAD_LIFECYCLE.
+  static const bool log_lifecycle =
+      std::getenv("XE_IM_LOAD_LIFECYCLE") != nullptr;
+  const bool lifecycle_this_load = log_lifecycle &&
+                                    shader_type == xenos::ShaderType::kVertex &&
+                                    size_dwords == 285;
+  uint32_t lifecycle_guest_addr = 0;
+  std::vector<uint32_t> lifecycle_snap0;
+  const uint32_t* lifecycle_host_words = nullptr;
+  if (lifecycle_this_load) {
+    lifecycle_host_words = reinterpret_cast<const uint32_t*>(reader_.read_ptr());
+    lifecycle_guest_addr = memory_->HostToGuestVirtual(
+        reinterpret_cast<const void*>(reader_.read_ptr()));
+    lifecycle_snap0.resize(size_dwords);
+    for (uint32_t i = 0; i < size_dwords; ++i) {
+      lifecycle_snap0[i] = xe::load_and_swap<uint32_t>(lifecycle_host_words + i);
+    }
+  }
   auto shader = COMMAND_PROCESSOR::LoadShader(
       shader_type, uint32_t(reader_.read_ptr()),
       reinterpret_cast<uint32_t*>(reader_.read_ptr()), size_dwords);
+  if (log_wrm_immediate && shader_type == xenos::ShaderType::kVertex) {
+    XELOGW(
+        "IM_LOAD_IMMEDIATE-TRACE vertex in_ib={} ring_off={:06X} dwords={} "
+        "hash={:016X}",
+        g_pm4_in_ib, im_load_immediate_ring_off, size_dwords,
+        shader->ucode_data_hash());
+    Pm4DumpRecent("IM_LOAD_IMMEDIATE vertex shader load");
+  }
+  if (lifecycle_this_load) {
+    Pm4ImLoadImmDiagnose(lifecycle_guest_addr, im_load_immediate_ring_off,
+                          g_pm4_in_ib, size_dwords, lifecycle_snap0,
+                          lifecycle_host_words, shader->ucode_data_hash());
+  }
   switch (shader_type) {
     case xenos::ShaderType::kVertex:
       active_vertex_shader_ = shader;
@@ -1746,6 +2325,7 @@ uint32_t COMMAND_PROCESSOR::ExecutePrimaryBuffer(uint32_t read_index,
       // macos-arm64 Fable II bring-up: no assert_always() (SIGTRAPs in this
       // NDEBUG build). Stale ring content reaches here; just stop.
       XELOGE("**** PRIMARY RINGBUFFER: Failed to execute packet.");
+      Pm4DumpRecent("primary ring bad packet");
       break;
     }
     if (wrm_deadlock_abort_) {

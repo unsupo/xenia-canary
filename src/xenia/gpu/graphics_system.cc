@@ -328,6 +328,9 @@ void GraphicsSystem::WriteRegister(uint32_t addr, uint32_t value) {
     case 0x01C5:  // CP_RB_WPTR
       command_processor_->UpdateWritePointer(value);
       break;
+    case 0x01F4:  // CP_INT_ACK
+      this->register_file()->values[0x01F3] &= ~value;
+      return;
     case 0x1844:  // AVIVO_D1GRPH_PRIMARY_SURFACE_ADDRESS
       break;
     default:
@@ -348,6 +351,16 @@ void GraphicsSystem::EnableReadPointerWriteBack(uint32_t ptr,
   command_processor_->EnableReadPointerWriteBack(ptr, block_size_log2);
 }
 
+// Read/write a guest u32 (big-endian) applying the same +0x1000 fixup the
+// A64 JIT does for >= 0xE0000000 addresses on 16 KB-page hosts (see
+// a64_seq_util.h ComputeMemoryAddress) so we hit the page the guest reads.
+static inline uint8_t* GuestU32Host(uint8_t* base, uint32_t guest_addr) {
+  if (guest_addr >= 0xE0000000 && xe::memory::allocation_granularity() > 0x1000) {
+    guest_addr += 0x1000;
+  }
+  return base + guest_addr;
+}
+
 void GraphicsSystem::SetInterruptCallback(uint32_t callback,
                                           uint32_t user_data) {
   interrupt_callback_ = callback;
@@ -356,6 +369,15 @@ void GraphicsSystem::SetInterruptCallback(uint32_t callback,
   // fields drive the frame-pacing fence: +0x2a90 -> pointer to the value
   // the guest polls, +0x2a9c -> the value it wants that pointer to reach.
   swap_sync_object_ = user_data;
+
+  if (callback) {
+    uint8_t* base = memory_->virtual_membase();
+    uint32_t* host_code = reinterpret_cast<uint32_t*>(base + callback);
+    XELOGI("Disassembling guest ISR at {:08X}:", callback);
+    for (int i = 0; i < 64; ++i) {
+      XELOGI("  0x{:08X}: {:08X}", callback + i * 4, __builtin_bswap32(host_code[i]));
+    }
+  }
 }
 
 void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
@@ -377,16 +399,6 @@ void GraphicsSystem::SetGpuIdentifierValue(uint32_t value) {
              prev, value, std::memory_order_relaxed)) {
   }
   PublishGpuIdentifier();
-}
-
-// Read/write a guest u32 (big-endian) applying the same +0x1000 fixup the
-// A64 JIT does for >= 0xE0000000 addresses on 16 KB-page hosts (see
-// a64_seq_util.h ComputeMemoryAddress) so we hit the page the guest reads.
-static inline uint8_t* GuestU32Host(uint8_t* base, uint32_t guest_addr) {
-  if (guest_addr >= 0xE0000000 && xe::memory::allocation_granularity() > 0x1000) {
-    guest_addr += 0x1000;
-  }
-  return base + guest_addr;
 }
 
 void GraphicsSystem::PublishGpuIdentifier() {

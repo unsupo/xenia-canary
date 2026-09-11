@@ -9,6 +9,8 @@
 
 #include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
 
+#include <atomic>
+
 #include "xenia/base/atomic.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
@@ -525,80 +527,6 @@ DEFINE_bool(
     "Kernel");
 
 dword_result_t NtYieldExecution_entry(const ppc_context_t& ctx) {
-  // macos-arm64 Fable II bring-up. Fully traced (see git log): guest thread
-  // 0x15 (D3D resource producer) wedges at the title screen spinning at
-  // lr=0x82CBD0A8 -> caller 0x822E062C -> readiness predicate 0x822A8E78, which
-  // returns *(pool[+4] + round4(pool[+0xC])) - a slot in a ~16MB GPU-resource
-  // recycle ring (pool struct in r31). The pool's producer index pool[+0x3C]
-  // never advances past the consumer index pool[+0xC]; nothing ever posts a
-  // completion token, so the slot stays 0 and the thread yields forever.
-  {
-    static thread_local uint32_t last_lr = 0;
-    static thread_local uint64_t run = 0;
-    uint32_t lr = static_cast<uint32_t>(ctx->lr);
-    if (lr == last_lr) {
-      ++run;
-      auto gv = [&](uint32_t a) {
-        return a ? xe::load_and_swap<uint32_t>(ctx->TranslateVirtual(a)) : 0u;
-      };
-      if (cvars::log_guest_yield_spin &&
-          (run == 300000 || (run > 300000 && (run % 2000000) == 0))) {
-        uint32_t r31 = uint32_t(ctx->r[31]);
-        uint32_t pbase = gv(r31 + 4);
-        uint32_t poc = gv(r31 + 0xC);
-        uint32_t slot = pbase + ((poc + 3) & ~3u);
-        XELOGW(
-            "guest yield-spin @lr={:08X} run={} r31(pool)={:08X}: ring={:08X} "
-            "consumer_idx={:08X} producer_idx={:08X} cached={:08X} "
-            "poll[{:08X}]={:08X}  (nothing posting to this ring -> wedge)",
-            lr, run, r31, pbase, poc, gv(r31 + 0x3C), gv(r31 + 0x10), slot,
-            gv(slot));
-      }
-      // The wedge is specifically lr=0x82CBD0A8 (the 0x82CBD098 yield helper).
-      // Fully traced: the readiness predicate 0x822A8E78 returns 0 - NOT the
-      // ring slot - because at 0x822A8EC0 it finds the *producer* index
-      // pool[+0x3C] (copied to pool[+0x10] by 0x822943E8) has not reached
-      // round4(pool[+0xC]) + 4. i.e. producer_idx == consumer_idx == ring empty,
-      // and nothing on this port ever advances pool[+0x3C]. The slot itself is
-      // already seeded (poll[slot] == 1). So: after a clearly-stuck run, step
-      // the producer index one entry (8 bytes) past the consumer index. The
-      // predicate then reads the (already non-zero) slot, the consumer dequeues
-      // one item, advances pool[+0xC] by 8, and loops for the next - which we
-      // feed again on the next wedge, draining the ring at ~1 entry/wedge until
-      // the real producer (if it ever unblocks) takes over.
-      if (cvars::break_fable2_resource_wedge && lr == 0x82CBD0A8u &&
-          run >= 400000 && (run % 100000) == 0) {
-        uint32_t r31 = uint32_t(ctx->r[31]);
-        uint32_t pbase = gv(r31 + 4);
-        if (r31 >= 0x40000000u && r31 < 0x50000000u && pbase >= 0x40000000u &&
-            pbase < 0x50000000u) {
-          uint32_t poc = gv(r31 + 0xC);
-          uint32_t prod = gv(r31 + 0x3C);
-          if (prod <= poc) {
-            uint32_t want = ((poc + 3) & ~3u) + 8;
-            xe::store_and_swap<uint32_t>(ctx->TranslateVirtual(r31 + 0x3C),
-                                         want);
-            // Make sure the slot the predicate is about to read is non-zero.
-            uint32_t slot = pbase + ((poc + 3) & ~3u);
-            uint8_t* hp = ctx->TranslateVirtual(slot);
-            if (xe::load_and_swap<uint32_t>(hp) == 0) {
-              xe::store_and_swap<uint32_t>(hp, 1u);
-            }
-            static std::atomic<uint32_t> warn{0};
-            if ((warn++ & 0x1F) == 0) {
-              XELOGW(
-                  "Fable II resource wedge: advanced producer index {:08X}->"
-                  "{:08X} (pool {:08X}, consumer {:08X}) after {} spins",
-                  prod, want, r31, poc, run);
-            }
-          }
-        }
-      }
-    } else {
-      last_lr = lr;
-      run = 0;
-    }
-  }
   xe::threading::MaybeYield();
   return 0;
 }
@@ -687,9 +615,17 @@ void KeInitializeEvent_entry(pointer_t<X_KEVENT> event_ptr, dword_t event_type,
 DECLARE_XBOXKRNL_EXPORT1(KeInitializeEvent, kThreading, kImplemented);
 
 uint32_t xeKeSetEvent(X_KEVENT* event_ptr, uint32_t increment, uint32_t wait) {
+  if (!event_ptr) {
+    return 0;
+  }
+  uint32_t guest_addr = kernel_state()->memory()->HostToGuestVirtual(event_ptr);
+  if (guest_addr == 0xF80000CC || (reinterpret_cast<uintptr_t>(event_ptr) & 0xFFFFFFFF) == 0xF80000CC) {
+    XELOGI("!!! KeSetEvent TARGET EVENT MATCH !!! event_ptr={:08X}, increment={}, wait={}", guest_addr, increment, wait);
+  }
   auto ev = XObject::GetNativeObject<XEvent>(kernel_state(), event_ptr,
                                              event_ptr->header.type);
   if (!ev) {
+    XELOGW("xeKeSetEvent: NULL object for event_ptr={:08X}", guest_addr);
     assert_always();
     return 0;
   }

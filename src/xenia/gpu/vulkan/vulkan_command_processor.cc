@@ -1517,8 +1517,38 @@ void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
     current_constant_buffers_up_to_date_ &=
         ~(UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFetch);
     if (texture_cache_) {
-      texture_cache_->TextureFetchConstantWritten(
-          (index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 6);
+      uint32_t texture_slot =
+          (index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 6;
+      // macos-arm64 Fable II bring-up, Phase 20: the fetch-constant
+      // register range is shared between texture (6 dwords/slot) and
+      // vertex (2 dwords/slot, 3 vertex slots alias one texture slot)
+      // fetch constants - real hardware. A write meant only as a vertex
+      // fetch constant can land on the same dwords as an already-valid
+      // texture fetch constant that a different, still-pending draw
+      // needs (see scratch/fable2_re/SESSION_LOG.md Phase 16-19: traced
+      // this exact sequence in Fable II's Bink-video compositing - the
+      // game's own PM4 stream writes a valid luma texture descriptor,
+      // then a vertex-fetch-shaped write to the identical registers for
+      // an unrelated draw, then a second draw that still needs the
+      // texture reads the clobbered vertex data). The game ships and
+      // works on real hardware, so real hardware's texture-sampling path
+      // most likely latches/caches its descriptor independently of a
+      // live vertex-fetch-shaped write to the same bytes - approximate
+      // that here: only invalidate the resolved texture binding if the
+      // slot's first dword (which carries FetchConstantType in its low 2
+      // bits) still looks like a texture descriptor after this write. A
+      // write that makes it look like a vertex constant instead doesn't
+      // invalidate the texture side.
+      static const bool disable_fix =
+          std::getenv("XE_DISABLE_FETCH_ALIAS_FIX") != nullptr;
+      uint32_t slot_dword0 = register_file_->values
+          [XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + texture_slot * 6];
+      bool looks_like_texture =
+          (slot_dword0 & 0x3) ==
+          uint32_t(xenos::FetchConstantType::kTexture);
+      if (disable_fix || looks_like_texture) {
+        texture_cache_->TextureFetchConstantWritten(texture_slot);
+      }
     }
   } else if (index == XE_GPU_REG_VGT_MAX_VTX_INDX ||
              index == XE_GPU_REG_VGT_MIN_VTX_INDX ||
@@ -1575,6 +1605,23 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
   swap_request_count_.fetch_add(1, std::memory_order_relaxed);
+
+  // macos-arm64 Fable II bring-up: trace the real swap/present path so we can
+  // see how often (and whether) a composited frame actually reaches the
+  // presenter vs. how often the game re-resolves it. Gated by XE_LOG_SWAP.
+  {
+    static const bool log_swap = std::getenv("XE_LOG_SWAP") != nullptr;
+    if (log_swap) {
+      auto swap_fetch = register_file_->GetTextureFetch(0);
+      uint32_t tf0_base = swap_fetch.base_address << 12;
+      XELOGI(
+          "ISSUESWAP-TRACE #{} fb_phys=0x{:08X} tf0_base=0x{:08X} {}x{} "
+          "presenter={}",
+          swap_request_count_.load(std::memory_order_relaxed), frontbuffer_ptr,
+          tf0_base, frontbuffer_width, frontbuffer_height,
+          graphics_system_->presenter() ? "yes" : "NULL(headless)");
+    }
+  }
 
   ui::Presenter* presenter = graphics_system_->presenter();
   if (!presenter) {
@@ -1726,8 +1773,10 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
       frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_format,
       frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
   if (swap_texture_view == VK_NULL_HANDLE) {
+    XELOGE("ISSUESWAP: RequestSwapTexture returned VK_NULL_HANDLE for fb_ptr=0x{:08X}", frontbuffer_ptr);
     return;
   }
+  XELOGI("ISSUESWAP: RequestSwapTexture SUCCEEDED for fb_ptr=0x{:08X}, calling RefreshGuestOutput", frontbuffer_ptr);
 
   auto aspect = graphics_system_->GetScaledAspectRatio();
 

@@ -9,6 +9,9 @@
 
 #include "xenia/gpu/command_processor.h"
 
+#include <cstdlib>
+#include <cstring>
+
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
@@ -333,6 +336,19 @@ void CommandProcessor::SetDesiredSwapPostEffect(
   });
 }
 
+void CommandProcessor::RequestSwapAfterRingDrain(
+    uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+    uint32_t frontbuffer_height,
+    const xenos::xe_gpu_texture_fetch_t& swap_fetch) {
+  XELOGI("DEFERRED-SWAP-REQ fb_ptr=0x{:08X} {}x{}", frontbuffer_ptr,
+         frontbuffer_width, frontbuffer_height);
+  deferred_swap_frontbuffer_ptr_ = frontbuffer_ptr;
+  deferred_swap_frontbuffer_width_ = frontbuffer_width;
+  deferred_swap_frontbuffer_height_ = frontbuffer_height;
+  deferred_swap_fetch_ = swap_fetch;
+  deferred_swap_pending_.store(true, std::memory_order_release);
+}
+
 void CommandProcessor::WorkerThreadMain() {
   if (!SetupContext()) {
     xe::FatalError("Unable to setup command processor internal state");
@@ -355,6 +371,14 @@ void CommandProcessor::WorkerThreadMain() {
 
     uint32_t write_ptr_index = write_ptr_index_.load();
     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
+      if (deferred_swap_pending_.exchange(false, std::memory_order_acquire)) {
+        XELOGI("DEFERRED-SWAP-EXEC fb_ptr=0x{:08X} {}x{}",
+               deferred_swap_frontbuffer_ptr_, deferred_swap_frontbuffer_width_,
+               deferred_swap_frontbuffer_height_);
+        register_file_->SetTextureFetch(0, deferred_swap_fetch_);
+        IssueSwap(deferred_swap_frontbuffer_ptr_, deferred_swap_frontbuffer_width_,
+                  deferred_swap_frontbuffer_height_);
+      }
       SCOPE_profile_cpu_i("gpu", "xe::gpu::CommandProcessor::Stall");
       // We've run out of commands to execute.
       // We spin here waiting for new ones, as the overhead of waiting on our
@@ -392,6 +416,15 @@ void CommandProcessor::WorkerThreadMain() {
     if (graphics_system_) {
       graphics_system_->SetGpuIdentifierValue(
           kickoff_count_.load(std::memory_order_relaxed));
+    }
+
+    // Fire any deferred out-of-band VdSwap present now - the ring (including
+    // this frame's composite resolve) has just been fully executed, so the
+    // front buffer the presenter is about to read is the finished frame.
+    if (deferred_swap_pending_.exchange(false, std::memory_order_acquire)) {
+      register_file_->SetTextureFetch(0, deferred_swap_fetch_);
+      IssueSwap(deferred_swap_frontbuffer_ptr_, deferred_swap_frontbuffer_width_,
+                deferred_swap_frontbuffer_height_);
     }
 
     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
@@ -741,6 +774,20 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
   if (XE_LIKELY(index < RegisterFile::kRegisterCount)) {
     register_file_->values[index] = value;
+
+    // macos-arm64 Fable II bring-up, Phase 17: trace writes to texture fetch
+    // constant slot 0 (registers 0x4800-0x4805, 6 dwords) specifically - the
+    // Bink video draws consistently read this slot as a degenerate 1x1
+    // "vertex fetch constant" instead of the expected full-res luma plane,
+    // while slots 1/2 (chroma) are always valid. This checks whether the
+    // game ever writes a real texture descriptor here at all, and if so,
+    // whether something (e.g. a vertex fetch constant reusing the same
+    // register range) overwrites it before the draw reads it.
+    static const bool log_fetch0 = std::getenv("XE_LOG_FETCH0") != nullptr;
+    if (XE_UNLIKELY(log_fetch0) && index >= 0x4800 && index <= 0x4805) {
+      XELOGW("FETCH0-WRITE reg={:04X} dword={} value={:08X}", index,
+             index - 0x4800, value);
+    }
 
     // quick pre-test
     // todo: figure out just how unlikely this is. if very (it ought to be,

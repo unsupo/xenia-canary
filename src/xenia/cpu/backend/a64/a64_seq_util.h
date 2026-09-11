@@ -352,6 +352,7 @@ inline XReg ComputeMemoryAddressWithOffset(A64Emitter& e, const I64Op& guest_bas
     e.add(e.w0, e.w0, 1, 12);  // add 0x1000 via LSL #12
     e.L(skip);
   }
+  e.mov(e.w0, e.w0);  // Ensure upper 32-bits of x0 are strictly zero
   return e.x0;
 }
 

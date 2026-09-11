@@ -1149,6 +1149,13 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(
     return nullptr;
   }
 
+  XELOGI(
+      "TextureCache::CreateTexture: fmt={:X} ({}) dims={}x{} pitch={} tiled={} "
+      "endian={} swizzle={:04X} vk_fmt={}",
+      uint32_t(key.format), FormatInfo::GetName(key.format),
+      key.GetWidth(), key.GetHeight(), key.pitch, key.tiled, uint32_t(key.endianness),
+      host_format.swizzle, uint32_t(formats[0]));
+
   const ui::vulkan::VulkanDevice* const vulkan_device =
       command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -2009,9 +2016,6 @@ VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed,
   const ui::vulkan::VulkanDevice* const vulkan_device =
       vulkan_texture_cache.command_processor_.GetVulkanDevice();
 
-  if (!vulkan_device->properties().imageViewFormatSwizzle) {
-    host_swizzle = xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
-  }
   view_key.host_swizzle = host_swizzle;
 
   view_key.is_array = uint32_t(is_array);
@@ -2031,10 +2035,17 @@ VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed,
   view_create_info.flags = 0;
   view_create_info.image = image();
   view_create_info.format = format;
-  view_create_info.components.r = GetComponentSwizzle(host_swizzle, 0);
-  view_create_info.components.g = GetComponentSwizzle(host_swizzle, 1);
-  view_create_info.components.b = GetComponentSwizzle(host_swizzle, 2);
-  view_create_info.components.a = GetComponentSwizzle(host_swizzle, 3);
+  if (!vulkan_device->properties().imageViewFormatSwizzle) {
+    view_create_info.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+    view_create_info.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+    view_create_info.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+    view_create_info.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+  } else {
+    view_create_info.components.r = GetComponentSwizzle(host_swizzle, 0);
+    view_create_info.components.g = GetComponentSwizzle(host_swizzle, 1);
+    view_create_info.components.b = GetComponentSwizzle(host_swizzle, 2);
+    view_create_info.components.a = GetComponentSwizzle(host_swizzle, 3);
+  }
   view_create_info.subresourceRange =
       ui::vulkan::util::InitializeSubresourceRange();
   switch (dimension) {

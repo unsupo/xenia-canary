@@ -9,6 +9,8 @@
 
 #include "xenia/gpu/draw_util.h"
 
+#include <cstdlib>
+
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
@@ -618,7 +620,16 @@ static inline void GetScissorTmpl(const RegisterFile& XE_RESTRICT regs,
   auto pa_sc_screen_scissor_br = regs.Get<reg::PA_SC_SCREEN_SCISSOR_BR>();
   uint32_t surface_pitch = 0;
   if constexpr (clamp_to_surface_pitch) {
-    surface_pitch = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
+    auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+    // RB_SURFACE_INFO.surface_pitch is in guest pixels; a >=4X-MSAA target
+    // stores twice the sample columns, so its real horizontal extent is
+    // surface_pitch << 1. Same normalization as RenderTargetCache /
+    // xenos::GetSurfacePitchTiles - without it, wide draws into a sub-pitch
+    // MSAA target (e.g. Fable II: surface_pitch=640, 4X) get their scissor
+    // clamped to half width.
+    surface_pitch = rb_surface_info.surface_pitch
+                    << uint32_t(rb_surface_info.msaa_samples >=
+                                xenos::MsaaSamples::k4X);
   }
   uint32_t pa_sc_window_scissor_tl_tl_x = pa_sc_window_scissor_tl.tl_x,
            pa_sc_window_scissor_tl_tl_y = pa_sc_window_scissor_tl.tl_y,
@@ -677,13 +688,13 @@ static inline void GetScissorTmpl(const RegisterFile& XE_RESTRICT regs,
   tmp1 = _mm_blend_epi16(lomax, himin, 0b11110000);
 
   if constexpr (clamp_to_surface_pitch) {
-    // Clamp the horizontal scissor to surface_pitch for safety, in case that's
-    // not done by the guest for some reason (it's not when doing draws without
-    // clipping in Direct3D 9, for instance), to prevent overflow - this is
-    // important for host implementations, both based on target-indepedent
-    // rasterization without render target width at all (pixel shader
-    // interlock-based custom RB implementations) and using conventional render
-    // targets, but padded to EDRAM tiles.
+    // Clamp the horizontal scissor to the (MSAA-scaled) surface_pitch for
+    // safety, in case that's not done by the guest for some reason (it's not
+    // when doing draws without clipping in Direct3D 9, for instance), to
+    // prevent overflow - this is important for host implementations, both
+    // based on target-indepedent rasterization without render target width at
+    // all (pixel shader interlock-based custom RB implementations) and using
+    // conventional render targets, but padded to EDRAM tiles.
     tmp1 = _mm_blend_epi16(
         tmp1, _mm_min_epi32(tmp1, _mm_set1_epi32(surface_pitch)), 0b00110011);
   }
@@ -704,7 +715,16 @@ static inline void GetScissorTmpl(const RegisterFile& XE_RESTRICT regs,
   auto pa_sc_screen_scissor_br = regs.Get<reg::PA_SC_SCREEN_SCISSOR_BR>();
   uint32_t surface_pitch = 0;
   if constexpr (clamp_to_surface_pitch) {
-    surface_pitch = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
+    auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+    // RB_SURFACE_INFO.surface_pitch is in guest pixels; a >=4X-MSAA target
+    // stores twice the sample columns, so its real horizontal extent is
+    // surface_pitch << 1. Same normalization as RenderTargetCache /
+    // xenos::GetSurfacePitchTiles - without it, wide draws into a sub-pitch
+    // MSAA target (e.g. Fable II: surface_pitch=640, 4X) get their scissor
+    // clamped to half width.
+    surface_pitch = rb_surface_info.surface_pitch
+                    << uint32_t(rb_surface_info.msaa_samples >=
+                                xenos::MsaaSamples::k4X);
   }
   uint32_t pa_sc_window_scissor_tl_tl_x = pa_sc_window_scissor_tl.tl_x,
            pa_sc_window_scissor_tl_tl_y = pa_sc_window_scissor_tl.tl_y,
@@ -748,14 +768,8 @@ static inline void GetScissorTmpl(const RegisterFile& XE_RESTRICT regs,
   br_x = std::min(br_x, int32_t(pa_sc_screen_scissor_br_br_x));
   br_y = std::min(br_y, int32_t(pa_sc_screen_scissor_br_br_y));
   if constexpr (clamp_to_surface_pitch) {
-    // Clamp the horizontal scissor to surface_pitch for safety, in case that's
-    // not done by the guest for some reason (it's not when doing draws without
-    // clipping in Direct3D 9, for instance), to prevent overflow - this is
-    // important for host implementations, both based on target-indepedent
-    // rasterization without render target width at all (pixel shader
-    // interlock-based custom RB implementations) and using conventional render
-    // targets, but padded to EDRAM tiles.
-
+    // Clamp the horizontal scissor to the (MSAA-scaled) surface_pitch for
+    // safety - see the SSE path above for the rationale.
     tl_x = std::min(tl_x, int32_t(surface_pitch));
     br_x = std::min(br_x, int32_t(surface_pitch));
   }
@@ -778,9 +792,39 @@ static inline void GetScissorTmpl(const RegisterFile& XE_RESTRICT regs,
 void GetScissor(const RegisterFile& XE_RESTRICT regs,
                 Scissor& XE_RESTRICT scissor_out, bool clamp_to_surface_pitch) {
   if (clamp_to_surface_pitch) {
-    return GetScissorTmpl<true>(regs, scissor_out);
+    GetScissorTmpl<true>(regs, scissor_out);
   } else {
-    return GetScissorTmpl<false>(regs, scissor_out);
+    GetScissorTmpl<false>(regs, scissor_out);
+  }
+
+  // macos-arm64 Fable II bring-up: trace the horizontal scissor whenever the
+  // surface-pitch clamp would actually bite (i.e. a draw wider than the active
+  // EDRAM surface pitch - the suspected 2D/Bink clipping condition). Read-only.
+  static const bool log_scissor = std::getenv("XE_LOG_SCISSOR") != nullptr;
+  if (log_scissor && clamp_to_surface_pitch) {
+    auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+    auto win_tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
+    auto win_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
+    auto scr_tl = regs.Get<reg::PA_SC_SCREEN_SCISSOR_TL>();
+    auto scr_br = regs.Get<reg::PA_SC_SCREEN_SCISSOR_BR>();
+    uint32_t raw_surface_pitch = rb_surface_info.surface_pitch;
+    int32_t surface_pitch = int32_t(
+        raw_surface_pitch << uint32_t(rb_surface_info.msaa_samples >=
+                                      xenos::MsaaSamples::k4X));
+    if (int32_t(win_br.br_x) > surface_pitch ||
+        int32_t(scr_br.br_x) > surface_pitch ||
+        int32_t(scissor_out.offset[0] + scissor_out.extent[0]) > surface_pitch) {
+      XELOGI(
+          "SCISSOR-TRACE surface_pitch={} (raw {}) msaa={} | WINDOW_SCISSOR "
+          "tl=({},{}) br=({},{}) woff_disable={} | SCREEN_SCISSOR tl=({},{}) "
+          "br=({},{}) | result off=({},{}) extent=({}x{})",
+          surface_pitch, raw_surface_pitch,
+          uint32_t(rb_surface_info.msaa_samples), win_tl.tl_x,
+          win_tl.tl_y, win_br.br_x, win_br.br_y,
+          uint32_t(win_tl.window_offset_disable), scr_tl.tl_x, scr_tl.tl_y,
+          scr_br.br_x, scr_br.br_y, scissor_out.offset[0], scissor_out.offset[1],
+          scissor_out.extent[0], scissor_out.extent[1]);
+    }
   }
 }
 
@@ -1097,16 +1141,31 @@ bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
     return false;
   }
 
-  // Clamp to the EDRAM surface pitch (maximum possible surface pitch is also
-  // assumed to be the largest resolvable size).
-  int32_t surface_pitch_aligned =
-      int32_t(rb_surface_info.surface_pitch &
-              ~uint32_t(xenos::kResolveAlignmentPixels - 1));
-  if (x1 > surface_pitch_aligned) {
+  // Clamp to the max resolvable width: the MSAA-scaled EDRAM surface pitch, or
+  // the resolve destination pitch, whichever is larger. surface_pitch is in
+  // guest pixels and a >=4X-MSAA source stores twice the sample columns (same
+  // normalization as GetScissor / RenderTargetCache); the destination pitch is
+  // a legitimate upper bound too since the resolve writes that many pixels per
+  // row.
+  uint32_t resolve_msaa_x_log2 =
+      uint32_t(rb_surface_info.msaa_samples >= xenos::MsaaSamples::k4X);
+  int32_t surface_pitch_aligned = int32_t(
+      (rb_surface_info.surface_pitch << resolve_msaa_x_log2) &
+      ~uint32_t(xenos::kResolveAlignmentPixels - 1));
+  auto rb_copy_dest_pitch = regs.Get<reg::RB_COPY_DEST_PITCH>();
+  uint32_t copy_dest_pitch_pixels =
+      (rb_copy_dest_pitch.copy_dest_pitch < xenos::kTextureTileWidthHeight)
+          ? (rb_copy_dest_pitch.copy_dest_pitch << 5)
+          : rb_copy_dest_pitch.copy_dest_pitch;
+  int32_t max_resolvable_width = std::max(
+      surface_pitch_aligned,
+      int32_t(xe::align(copy_dest_pitch_pixels,
+                        uint32_t(xenos::kResolveAlignmentPixels))));
+  if (x1 > max_resolvable_width) {
     XELOGE("Resolve region {} <= x < {} is outside the surface pitch {}", x0,
-           x1, surface_pitch_aligned);
-    x0 = std::min(x0, surface_pitch_aligned);
-    x1 = std::min(x1, surface_pitch_aligned);
+           x1, max_resolvable_width);
+    x0 = std::min(x0, max_resolvable_width);
+    x1 = std::min(x1, max_resolvable_width);
   }
   assert_true(x1 - x0 <= int32_t(xenos::kMaxResolveSize));
 
@@ -1192,15 +1251,21 @@ bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
   uint32_t rb_copy_dest_base = regs[XE_GPU_REG_RB_COPY_DEST_BASE];
   uint32_t copy_dest_base_adjusted = rb_copy_dest_base;
   uint32_t copy_dest_extent_start, copy_dest_extent_end;
-  auto rb_copy_dest_pitch = regs.Get<reg::RB_COPY_DEST_PITCH>();
+  rb_copy_dest_pitch = regs.Get<reg::RB_COPY_DEST_PITCH>();
+  copy_dest_pitch_pixels =
+      (rb_copy_dest_pitch.copy_dest_pitch < xenos::kTextureTileWidthHeight)
+          ? (rb_copy_dest_pitch.copy_dest_pitch << 5)
+          : rb_copy_dest_pitch.copy_dest_pitch;
   const uint32_t copy_dest_pitch_aligned =
-      xe::align(rb_copy_dest_pitch.copy_dest_pitch,
-                texture_address::kStoragePitchHeightAlignmentBlocks);
+      xe::align(copy_dest_pitch_pixels, xenos::kTextureTileWidthHeight);
   info_out.copy_dest_coordinate_info.pitch_aligned_div_32 =
       copy_dest_pitch_aligned >> 5;
+  uint32_t copy_dest_height_pixels =
+      (rb_copy_dest_pitch.copy_dest_height < xenos::kTextureTileWidthHeight)
+          ? (rb_copy_dest_pitch.copy_dest_height << 5)
+          : rb_copy_dest_pitch.copy_dest_height;
   const uint32_t copy_dest_height_aligned =
-      xe::align(rb_copy_dest_pitch.copy_dest_height,
-                texture_address::kStoragePitchHeightAlignmentBlocks);
+      xe::align(copy_dest_height_pixels, xenos::kTextureTileWidthHeight);
   info_out.copy_dest_coordinate_info.height_aligned_div_32 =
       copy_dest_height_aligned >> 5;
   const FormatInfo& dest_format_info = *FormatInfo::Get(dest_format);
@@ -1375,6 +1440,28 @@ bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
       FormatInfo::GetName(dest_format), rb_copy_dest_base, copy_dest_extent_start,
       copy_dest_extent_end);
 #endif
+
+  // macos-arm64 Fable II bring-up: trace every resolve's horizontal geometry so
+  // we can see whether the 2D/Bink resolve is being clamped to the 3D EDRAM
+  // surface pitch. Read-only. Gated by XE_LOG_SCISSOR.
+  static const bool log_scissor = std::getenv("XE_LOG_SCISSOR") != nullptr;
+  if (log_scissor) {
+    auto rb_copy_dest_pitch_dbg = regs.Get<reg::RB_COPY_DEST_PITCH>();
+    uint32_t copy_dest_pitch_px_dbg =
+        (rb_copy_dest_pitch_dbg.copy_dest_pitch < xenos::kTextureTileWidthHeight)
+            ? (rb_copy_dest_pitch_dbg.copy_dest_pitch << 5)
+            : rb_copy_dest_pitch_dbg.copy_dest_pitch;
+    XELOGI(
+        "RESOLVE-TRACE x={}..{} y={}..{} (w={}) | RB_SURFACE_INFO.surface_pitch"
+        "={} aligned={} | RB_COPY_DEST_PITCH raw_pitch={} -> {}px raw_height={} "
+        "| max_resolvable_width={} | dest_base=0x{:08X} dest_fmt={}",
+        x0, x1, y0, y1, x1 - x0, uint32_t(rb_surface_info.surface_pitch),
+        surface_pitch_aligned, uint32_t(rb_copy_dest_pitch_dbg.copy_dest_pitch),
+        copy_dest_pitch_px_dbg,
+        uint32_t(rb_copy_dest_pitch_dbg.copy_dest_height), max_resolvable_width,
+        rb_copy_dest_base, FormatInfo::GetName(dest_format));
+  }
+
   return true;
 }
 XE_MSVC_OPTIMIZE_REVERT()

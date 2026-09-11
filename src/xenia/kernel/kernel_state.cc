@@ -1412,6 +1412,7 @@ void KernelState::EmulateCPInterruptDPC(uint32_t interrupt_callback,
                                         uint32_t interrupt_callback_data,
                                         uint32_t source, uint32_t cpu) {
   if (!interrupt_callback) {
+    XELOGW("KernelState::EmulateCPInterruptDPC: interrupt_callback is NULL!");
     return;
   }
 

@@ -12,14 +12,94 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <unordered_set>
 
 #include "third_party/glslang/SPIRV/GLSL.std.450.h"
 #include "xenia/base/assert.h"
+#include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/gpu/spirv_compatibility.h"
 
 namespace xe {
 namespace gpu {
+
+namespace {
+
+// macos-arm64 Fable II bring-up, Phase 13: Phase 12's full-history diagnostic
+// (pm4_command_processor_implement.h) proved this isn't a memory race - the
+// "unknown ALU VECTOR opcode = 30/31" shaders are byte-for-byte identical
+// every time they're loaded, from many different addresses, thousands of
+// loads apart. That's real, deterministic content, not corruption. This
+// dumps the whole ucode blob (once per unique hash, to avoid repeat spam -
+// Phase 12 saw the same hash reloaded 1000+ times) and decodes every
+// 3-dword-aligned window as a ucode::AluInstruction - matching exactly how
+// ShaderTranslator::TranslateExecInstructions indexes ALU instructions
+// (ucode_dwords + instr_offset * 3) - flagging any whose vector_opc is 30/31
+// (outside the named 0-29 range) or scalar_opc is >=51 (outside 0-50).
+//
+// The key question (per the user's framing): for a flagged instruction, is
+// vector_write_mask() actually nonzero (real content wants this opcode to
+// execute and write something - an ISA/translator gap) or zero (the vector
+// slot is unused/padding, in which case ProcessVectorAluOperation's
+// used_result_components-based early-out should have skipped it before ever
+// reaching the "unknown opcode" switch - and reaching it anyway despite a
+// zero mask would point at a bug in that early-out or in the decode itself).
+std::unordered_set<uint64_t>& AluUcodeDumpedHashes() {
+  static thread_local std::unordered_set<uint64_t> hashes;
+  return hashes;
+}
+
+void DumpAluUcodeForUnknownOpcode(uint64_t shader_hash,
+                                   const std::vector<uint32_t>& uc) {
+  if (!AluUcodeDumpedHashes().insert(shader_hash).second) {
+    return;  // Already dumped this exact shader content once.
+  }
+  XELOGW("ALU-UCODE-DUMP hash={:016X} dwords={} (full ucode, hex, 8/line)",
+         shader_hash, uc.size());
+  for (size_t i = 0; i < uc.size(); i += 8) {
+    size_t n = std::min<size_t>(8, uc.size() - i);
+    std::string line;
+    for (size_t j = 0; j < n; ++j) {
+      line += fmt::format("{:08X} ", uc[i + j]);
+    }
+    XELOGW("  [{:04X}] {}", i, line);
+  }
+
+  // Real ALU/FETCH instructions are addressed 3-dword-aligned from dword 0.
+  for (size_t off = 0; off + 3 <= uc.size(); off += 3) {
+    const auto& op =
+        *reinterpret_cast<const ucode::AluInstruction*>(uc.data() + off);
+    uint32_t vec_op = uint32_t(op.vector_opcode());
+    uint32_t sca_op = uint32_t(op.scalar_opcode());
+    bool vec_bad = vec_op >= 30;
+    bool sca_bad = sca_op >= 51;
+    if (!vec_bad && !sca_bad) continue;
+    XELOGW(
+        "ALU-UCODE-DUMP hash={:016X} instr_offset={} (dword {}) raw=[{:08X} "
+        "{:08X} {:08X}] vector_opc={}{} vector_write_mask={:#06b} "
+        "vector_dest={} vector_clamp={} scalar_opc={}{} "
+        "scalar_write_mask={:#06b} scalar_dest={} is_predicated={} "
+        "pred_condition={} is_export={} const_0_rel_abs={} "
+        "const_1_rel_abs={}",
+        shader_hash, off / 3, off, uc[off], uc[off + 1], uc[off + 2], vec_op,
+        vec_bad ? " <-- OUT OF RANGE" : "", op.vector_write_mask(),
+        op.vector_dest(), op.vector_clamp(), sca_op,
+        sca_bad ? " <-- OUT OF RANGE" : "", op.scalar_write_mask(),
+        op.scalar_dest(), op.is_predicated(), op.predicate_condition(),
+        op.is_export(), op.is_const_0_addressed(), op.is_const_1_addressed());
+    if (off >= 3) {
+      XELOGW("    prev @ dword {}: [{:08X} {:08X} {:08X}]", off - 3,
+             uc[off - 3], uc[off - 2], uc[off - 1]);
+    }
+    if (off + 6 <= uc.size()) {
+      XELOGW("    next @ dword {}: [{:08X} {:08X} {:08X}]", off + 3,
+             uc[off + 3], uc[off + 4], uc[off + 5]);
+    }
+  }
+}
+
+}  // namespace
 
 spv::Id SpirvShaderTranslator::ZeroIfAnyOperandIsZero(spv::Id value,
                                                       spv::Id operand_0_abs,
@@ -863,7 +943,65 @@ spv::Id SpirvShaderTranslator::ProcessVectorAluOperation(
     }
   }
 
-  assert_unhandled_case(instr.vector_opcode);
+  // macos-arm64 Fable II bring-up, Phase 13 correction: reaching here means
+  // vector_opc (a 5-bit field, 0-31) holds 30 or 31 - the earlier "corrupt/
+  // racing shader upload" theory (below) is DISPROVEN by Phase 12's
+  // full-history diagnostic: this exact byte-for-byte content is reloaded
+  // identically from many different addresses, thousands of loads apart -
+  // that's deterministic real content, not a race. instr.vector_and_constant_
+  // result.original_write_mask (logged below) is the live answer to whether
+  // this instruction's vector slot is actually used or genuinely unused
+  // padding that a decode/early-out bug let through. No assert_unhandled_
+  // case() (SIGTRAPs in Debug/Checked - see base/assert.h): soft-fail this
+  // shader via EmitTranslationError below instead of taking the whole
+  // process down.
+  {
+    const auto& uc = current_shader().ucode_data();
+    uint64_t shader_hash = current_shader().ucode_data_hash();
+    XELOGE(
+        "SHADER-OP unknown ALU VECTOR opcode = {} (0x{:X}) name='{}' | shader "
+        "type={} hash={:016X} ucode_dwords={} vector_write_mask={:#06b} "
+        "vector_used_result_components={:#06b} changed_state={} first=["
+        "{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
+        uint32_t(instr.vector_opcode), uint32_t(instr.vector_opcode),
+        instr.vector_opcode_name ? instr.vector_opcode_name : "?",
+        uint32_t(current_shader().type()), shader_hash, uc.size(),
+        instr.vector_and_constant_result.original_write_mask,
+        instr.vector_and_constant_result.GetUsedResultComponents(),
+        uint32_t(ucode::GetAluVectorOpcodeInfo(instr.vector_opcode)
+                     .changed_state),
+        uc.size() > 0 ? uc[0] : 0, uc.size() > 1 ? uc[1] : 0,
+        uc.size() > 2 ? uc[2] : 0, uc.size() > 3 ? uc[3] : 0,
+        uc.size() > 4 ? uc[4] : 0, uc.size() > 5 ? uc[5] : 0);
+    DumpAluUcodeForUnknownOpcode(shader_hash, uc);
+  }
+  // macos-arm64 Fable II bring-up, Phase 15/28: XenosRecomp (a second, real
+  // Xbox 360 shader recompiler) doesn't fail the whole shader on an
+  // unmatched vector opcode either - its switch has no default case, so it
+  // silently contributes nothing for that one instruction and keeps
+  // translating the rest. Opcodes 30/31 are the only unmatched values (the
+  // ucode::AluVectorOpcode enum only defines 0-29); promoted to the default
+  // behavior since it's what let Fable II's disclaimer/title shaders render
+  // cleanly instead of failing translation outright. XE_ALU_SKIP_UNKNOWN_VECTOR_OP
+  // is kept as an override: set it to "0"/"none"/"false" to force the old
+  // fail-whole-shader behavior back on for regression comparison.
+  static const bool skip_unknown_vector_op = [] {
+    const char* env = std::getenv("XE_ALU_SKIP_UNKNOWN_VECTOR_OP");
+    if (!env) {
+      return true;
+    }
+    if (std::strcmp(env, "0") == 0 || std::strcmp(env, "none") == 0 ||
+        std::strcmp(env, "false") == 0) {
+      return false;
+    }
+    return true;
+  }();
+  if (skip_unknown_vector_op) {
+    if (!used_result_component_count) {
+      return spv::NoResult;
+    }
+    return const_float_vectors_0_[used_result_component_count - 1];
+  }
   EmitTranslationError("Unknown ALU vector operation");
   return spv::NoResult;
 }
@@ -1313,7 +1451,38 @@ spv::Id SpirvShaderTranslator::ProcessScalarAluOperation(
       return spv::NoResult;
   }
 
-  assert_unhandled_case(instr.scalar_opcode);
+  // macos-arm64 Fable II bring-up, Phase 13: see the vector-opcode default
+  // case above - same soft-fail-the-shader reasoning, plus the same full
+  // ucode dump for cross-referencing against the Xenos ISA / decoder.
+  {
+    const auto& uc = current_shader().ucode_data();
+    uint64_t shader_hash = current_shader().ucode_data_hash();
+    XELOGE(
+        "SHADER-OP unknown ALU SCALAR opcode = {} (0x{:X}) name='{}' | "
+        "shader hash={:016X} scalar_write_mask={:#06b}",
+        uint32_t(instr.scalar_opcode), uint32_t(instr.scalar_opcode),
+        instr.scalar_opcode_name ? instr.scalar_opcode_name : "?",
+        shader_hash, instr.scalar_result.original_write_mask);
+    DumpAluUcodeForUnknownOpcode(shader_hash, uc);
+  }
+  // macos-arm64 Fable II bring-up, Phase 15/28: see the vector-opcode case
+  // above - same XenosRecomp-mirroring skip, now promoted to default,
+  // scalar side. Same env-var override to force the old fail-whole-shader
+  // behavior back on.
+  static const bool skip_unknown_scalar_op = [] {
+    const char* env = std::getenv("XE_ALU_SKIP_UNKNOWN_VECTOR_OP");
+    if (!env) {
+      return true;
+    }
+    if (std::strcmp(env, "0") == 0 || std::strcmp(env, "none") == 0 ||
+        std::strcmp(env, "false") == 0) {
+      return false;
+    }
+    return true;
+  }();
+  if (skip_unknown_scalar_op) {
+    return const_float_0_;
+  }
   EmitTranslationError("Unknown ALU scalar operation");
   return spv::NoResult;
 }

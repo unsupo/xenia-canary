@@ -988,13 +988,26 @@ void TextureCache::BindingInfoFromFetchConstant(
           fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3,
           fetch.dword_4, fetch.dword_5);
       return;
-    default:
+    default: {
+      // macos-arm64 Fable II bring-up: characterise the junk - is this an
+      // uninitialised/fill pattern, or a real-but-mangled descriptor?
+      uint32_t d[6] = {fetch.dword_0, fetch.dword_1, fetch.dword_2,
+                       fetch.dword_3, fetch.dword_4, fetch.dword_5};
+      bool all_zero = true, all_fill = true;
+      for (uint32_t i = 0; i < 6; ++i) {
+        if (d[i] != 0) all_zero = false;
+        if (d[i] != 0xCDCDCDCDu && d[i] != 0xDEADBEEFu && d[i] != 0xFEEEFEEEu &&
+            d[i] != 0xBAADF00Du && d[i] != 0xFFFFFFFFu)
+          all_fill = false;
+      }
       XELOGW(
           "Texture fetch constant ({:08X} {:08X} {:08X} {:08X} {:08X} {:08X}) "
-          "is completely invalid!",
-          fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3,
-          fetch.dword_4, fetch.dword_5);
+          "is completely invalid! type={} [{}]",
+          d[0], d[1], d[2], d[3], d[4], d[5], uint32_t(fetch.type),
+          all_zero ? "ALL-ZERO/uninit" : all_fill ? "FILL-PATTERN/uninit"
+                                                  : "mangled-descriptor");
       return;
+    }
   }
 
   uint32_t width_minus_1, height_minus_1, depth_or_array_size_minus_1;

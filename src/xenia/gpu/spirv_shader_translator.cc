@@ -68,7 +68,19 @@ SpirvShaderTranslator::Features::Features(
       fragment_stores_and_atomics(
           vulkan_device->properties().fragmentStoresAndAtomics),
       clip_distance(vulkan_device->properties().shaderClipDistance),
-      cull_distance(vulkan_device->properties().shaderCullDistance),
+      // macos-arm64 Fable II bring-up: MoltenVK advertises shaderCullDistance
+      // (VkPhysicalDeviceFeatures) but its bundled SPIRV-Cross has an MSL
+      // codegen bug for gl_CullDistance array outputs - it declares the
+      // flattened Metal output member as gl_CullDistance_0 but the emitted
+      // shader body still indexes it as an array (gl_CullDistance[0]),
+      // failing the Metal compile with "no member named 'gl_CullDistance' in
+      // 'main0_out'". Force clip-plane emission down the ClipDistance path
+      // (which MoltenVK's SPIRV-Cross does handle) on MoltenVK specifically -
+      // see the divergent_float_constant_gather cvar above for the precedent
+      // of gating a workaround on this driver alone.
+      cull_distance(vulkan_device->properties().shaderCullDistance &&
+                    vulkan_device->properties().driverID !=
+                        VK_DRIVER_ID_MOLTENVK),
       image_view_format_swizzle(
           vulkan_device->properties().imageViewFormatSwizzle),
       signed_zero_inf_nan_preserve_float32(

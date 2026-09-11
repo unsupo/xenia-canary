@@ -136,6 +136,20 @@ class CommandProcessor {
 
   void CallInThread(std::function<void()> fn);
 
+  // Request a front-buffer present that is sequenced *after* the ring buffer
+  // has been drained. The guest's VdSwap shim runs out-of-band via
+  // CallInThread, and pending_fns_ are drained at the top of the worker loop -
+  // *before* ExecutePrimaryBuffer - so a direct IssueSwap there races ahead of
+  // the composite resolve the guest submitted to the ring just before calling
+  // VdSwap (observed: VDSWAP -> ISSUESWAP -> RESOLVE, i.e. presenting a stale /
+  // half-composited frame). Recording the request here instead makes the
+  // worker fire it after the next ExecutePrimaryBuffer, in program order with
+  // the rendering commands.
+  void RequestSwapAfterRingDrain(uint32_t frontbuffer_ptr,
+                                 uint32_t frontbuffer_width,
+                                 uint32_t frontbuffer_height,
+                                 const xenos::xe_gpu_texture_fetch_t& swap_fetch);
+
   virtual void ClearCaches();
 
   // "Desired" is for the external thread managing the post-processing effect.
@@ -558,6 +572,17 @@ class CommandProcessor {
   // Incremented on each IssueSwap (real frame presentation). Used as the
   // "genuine forward progress" signal by the WAIT_REG_MEM deadlock breaker.
   std::atomic<uint32_t> swap_request_count_{0};
+  // Deferred out-of-band VdSwap present, see RequestSwapAfterRingDrain(). Fired
+  // by the worker after ExecutePrimaryBuffer so it lands after the composite
+  // resolve rather than before it.
+  std::atomic<bool> deferred_swap_pending_{false};
+  uint32_t deferred_swap_frontbuffer_ptr_ = 0;
+  uint32_t deferred_swap_frontbuffer_width_ = 0;
+  uint32_t deferred_swap_frontbuffer_height_ = 0;
+  // Texture fetch slot 0 as it was at VdSwap time - the ring commands executed
+  // before the deferred present can clobber it, so it's captured and re-applied
+  // just before IssueSwap (which presents whatever is in fetch slot 0).
+  xenos::xe_gpu_texture_fetch_t deferred_swap_fetch_{};
   // Set while the worker is parked in a PM4 WAIT_REG_MEM memory poll that isn't
   // being satisfied - i.e. the ring isn't literally drained but the GPU has
   // consumed everything it can until the guest feeds it more. The frame-pacing

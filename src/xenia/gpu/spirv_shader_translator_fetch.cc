@@ -15,6 +15,7 @@
 #include "third_party/fmt/include/fmt/format.h"
 #include "third_party/glslang/SPIRV/GLSL.std.450.h"
 #include "xenia/base/assert.h"
+#include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/render_target_cache.h"
@@ -610,7 +611,25 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
       used_result_nonzero_components &= ~uint32_t(0b1000);
       break;
     default:
-      assert_unhandled_case(instr.opcode);
+      // macos-arm64 Fable II bring-up: reaching here has been observed with
+      // opcode values (2, 20, 31) that FetchOpcode doesn't define (valid: 0,
+      // 1, 16-19, 24-26) - undefined microcode, not a missing feature. Seen
+      // paired with the same corrupt-vertex-shader-upload symptom as the ALU
+      // vector default case. No assert_unhandled_case() (SIGTRAPs in Debug/
+      // Checked): soft-fail this shader via EmitTranslationError below.
+      {
+        const auto& uc = current_shader().ucode_data();
+        XELOGE(
+            "SHADER-OP unknown TEXTURE FETCH opcode = {} (0x{:X}) name='{}' "
+            "dim={} | shader type={} hash={:016X} ucode_dwords={} "
+            "first=[{:08X} {:08X} {:08X} {:08X}]",
+            uint32_t(instr.opcode), uint32_t(instr.opcode),
+            instr.opcode_name ? instr.opcode_name : "?",
+            uint32_t(instr.dimension), uint32_t(current_shader().type()),
+            current_shader().ucode_data_hash(), uc.size(),
+            uc.size() > 0 ? uc[0] : 0, uc.size() > 1 ? uc[1] : 0,
+            uc.size() > 2 ? uc[2] : 0, uc.size() > 3 ? uc[3] : 0);
+      }
       EmitTranslationError("Unknown texture fetch operation");
       used_result_nonzero_components = 0;
   }

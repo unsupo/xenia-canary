@@ -10,6 +10,8 @@
 #include "xenia/gpu/vulkan/vulkan_pipeline_cache.h"
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <set>
 
@@ -433,20 +435,35 @@ VulkanPipelineCache::GetCurrentVertexShaderModification(
         regs.Get<reg::VGT_HOS_CNTL>().tess_mode;
   }
 
+  // macos-arm64 Fable II bring-up: MoltenVK advertises shaderCullDistance but
+  // its bundled SPIRV-Cross mistranslates gl_CullDistance array writes to MSL
+  // (declares the flattened member gl_CullDistance_0 but the shader body
+  // still indexes it as an array), failing vkCreateGraphicsPipelines. Never
+  // request the CullDistance path on this driver: user clip planes fall back
+  // to ClipDistance (MoltenVK's SPIRV-Cross handles that correctly), and
+  // vertex-kill-AND falls back to the existing OR/NaN-position kill path -
+  // an approximation (whole-primitive AND-cull vs. per-vertex OR-kill) traded
+  // for not crashing pipeline creation at all.
+  bool cull_distance_supported =
+      command_processor_.GetVulkanDevice()->properties().shaderCullDistance &&
+      command_processor_.GetVulkanDevice()->properties().driverID !=
+          VK_DRIVER_ID_MOLTENVK;
+
   // User clip planes.
   auto pa_cl_clip_cntl = regs.Get<reg::PA_CL_CLIP_CNTL>();
   uint32_t user_clip_planes =
       pa_cl_clip_cntl.clip_disable ? 0 : pa_cl_clip_cntl.ucp_ena;
   modification.vertex.user_clip_plane_count = xe::bit_count(user_clip_planes);
   modification.vertex.user_clip_plane_cull =
-      uint32_t(user_clip_planes && pa_cl_clip_cntl.ucp_cull_only_ena);
+      uint32_t(user_clip_planes && pa_cl_clip_cntl.ucp_cull_only_ena &&
+               cull_distance_supported);
 
   // Vertex kill via the kill flag (oPts.z). The "and" operator (kill only when
   // all vertices of the primitive request it) is emulated with a cull distance;
   // the "or" operator sets the position to NaN in the translator.
   modification.vertex.vertex_kill_and =
       uint32_t((shader.writes_point_size_edge_flag_kill_vertex() & 0b100) &&
-               !pa_cl_clip_cntl.vtx_kill_or);
+               !pa_cl_clip_cntl.vtx_kill_or && cull_distance_supported);
 
   if (host_vertex_shader_type ==
       Shader::HostVertexShaderType::kPointListAsTriangleStrip) {
@@ -3219,6 +3236,33 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
           "(tessellated={}, result={})",
           creation_arguments.vertex_shader->shader().ucode_data_hash(),
           is_tessellated, static_cast<int>(result));
+    }
+    // macos-arm64 Fable II bring-up: vkCreateGraphicsPipelines can fail on
+    // MoltenVK at the SPIRV-Cross MSL translation step (unsupported
+    // capability, a layout Metal doesn't allow, an out-of-bounds binding)
+    // rather than at Xenia's own translation - dump the exact SPIR-V that was
+    // handed to MoltenVK so it can be inspected offline (spirv-dis / run
+    // through spirv-cross --msl directly to see its own error). Gated by
+    // XE_DUMP_FAILED_SPIRV (a directory prefix) since these binaries are
+    // large; off by default.
+    if (const char* dump_dir = std::getenv("XE_DUMP_FAILED_SPIRV")) {
+      auto dump_one = [&](const char* stage,
+                          VulkanShader::VulkanTranslation* t) {
+        if (!t) return;
+        const std::vector<uint8_t>& spirv = t->translated_binary();
+        std::string path = fmt::format("{}/{}_{}_{:016X}.spv", dump_dir, stage,
+                                       static_cast<int>(result),
+                                       t->shader().ucode_data_hash());
+        FILE* f = std::fopen(path.c_str(), "wb");
+        if (f) {
+          std::fwrite(spirv.data(), 1, spirv.size(), f);
+          std::fclose(f);
+          XELOGE("  -> dumped {} SPIR-V ({} bytes) to {}", stage, spirv.size(),
+                 path);
+        }
+      };
+      dump_one("vs", creation_arguments.vertex_shader);
+      dump_one("ps", creation_arguments.pixel_shader);
     }
     return false;
   }

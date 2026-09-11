@@ -337,10 +337,28 @@ static void DarwinExceptionHandlerCallback(int signal_number, siginfo_t* signal_
           Exception::AccessViolationOperation::kUnknown;
 #if XE_ARCH_ARM64
       bool instruction_is_store = false;
-      if (mc->__ss.__pc &&
-          IsArm64LoadPrefetchStore(
-              *reinterpret_cast<const uint32_t*>(mc->__ss.__pc),
-              instruction_is_store)) {
+      uint32_t instruction = 0;
+      bool can_read_pc = false;
+#ifdef __APPLE__
+      if (mc->__ss.__pc && (mc->__ss.__pc & 0x3) == 0) {
+        vm_offset_t data_out = 0;
+        mach_msg_type_number_t count = 0;
+        if (vm_read(mach_task_self(), static_cast<vm_address_t>(mc->__ss.__pc),
+                    sizeof(uint32_t), &data_out, &count) == KERN_SUCCESS &&
+            count >= sizeof(uint32_t)) {
+          instruction = *reinterpret_cast<const uint32_t*>(data_out);
+          vm_deallocate(mach_task_self(), data_out, count);
+          can_read_pc = true;
+        }
+      }
+#else
+      if (mc->__ss.__pc && (mc->__ss.__pc & 0x3) == 0) {
+        instruction = *reinterpret_cast<const uint32_t*>(mc->__ss.__pc);
+        can_read_pc = true;
+      }
+#endif
+      if (can_read_pc &&
+          IsArm64LoadPrefetchStore(instruction, instruction_is_store)) {
         access_violation_operation =
             instruction_is_store ? Exception::AccessViolationOperation::kWrite
                                  : Exception::AccessViolationOperation::kRead;

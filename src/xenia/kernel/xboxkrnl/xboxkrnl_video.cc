@@ -9,6 +9,9 @@
 
 #include "xenia/kernel/xboxkrnl/xboxkrnl_video.h"
 
+#include <atomic>
+#include <cstdlib>
+
 #include "xenia/base/logging.h"
 #include "xenia/emulator.h"
 #include "xenia/gpu/command_processor.h"
@@ -481,6 +484,19 @@ void VdSwap_entry(
 
   namespace xenos = xe::gpu::xenos;
 
+  // macos-arm64 Fable II bring-up: trace every VdSwap so we can correlate it
+  // with the composite resolves (RESOLVE-TRACE, dest 0x1ECFC000). Gated by
+  // XE_LOG_SWAP.
+  static const bool log_swap = std::getenv("XE_LOG_SWAP") != nullptr;
+  if (log_swap) {
+    static std::atomic<uint32_t> vdswap_n{0};
+    XELOGI(
+        "VDSWAP-TRACE #{} fb_virt=0x{:08X} fmt={} color_space={} {}x{}",
+        vdswap_n.fetch_add(1) + 1, uint32_t(*frontbuffer_ptr),
+        uint32_t(texture_format_ptr.value()), uint32_t(*color_space_ptr),
+        uint32_t(*width), uint32_t(*height));
+  }
+
   xenos::xe_gpu_texture_fetch_t gpu_fetch;
   xe::copy_and_swap_32_unaligned(
       &gpu_fetch, reinterpret_cast<uint32_t*>(fetch_ptr.host_address()), 6);
@@ -519,39 +535,50 @@ void VdSwap_entry(
   // token value. It'd be nice to figure out what this is really doing so
   // that we could simulate it, though due to TCR I bet all games need to
   // use this method.
-  buffer_ptr.Zero(64 * 4);
+  // NOTE: Overwriting buffer_ptr with PM4_XE_SWAP packets can corrupt active
+  // Indirect Buffers (e.g. inline IM_LOAD_IMMEDIATE shader microcode in Fable II).
+  // Gate this behind XE_VD_SWAP_WRITE_BUFFER (off by default).
+  static const bool write_swap_buffer =
+      std::getenv("XE_VD_SWAP_WRITE_BUFFER") != nullptr;
+  if (write_swap_buffer) {
+    buffer_ptr.Zero(64 * 4);
 
-  uint32_t offset = 0;
-  auto dwords = buffer_ptr.as_array<uint32_t>();
+    uint32_t offset = 0;
+    auto dwords = buffer_ptr.as_array<uint32_t>();
 
-  // Write in the GPU texture fetch.
-  dwords[offset++] =
-      xenos::MakePacketType0(gpu::XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0, 6);
-  dwords[offset++] = gpu_fetch.dword_0;
-  dwords[offset++] = gpu_fetch.dword_1;
-  dwords[offset++] = gpu_fetch.dword_2;
-  dwords[offset++] = gpu_fetch.dword_3;
-  dwords[offset++] = gpu_fetch.dword_4;
-  dwords[offset++] = gpu_fetch.dword_5;
+    // Write in the GPU texture fetch.
+    dwords[offset++] =
+        xenos::MakePacketType0(gpu::XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0, 6);
+    dwords[offset++] = gpu_fetch.dword_0;
+    dwords[offset++] = gpu_fetch.dword_1;
+    dwords[offset++] = gpu_fetch.dword_2;
+    dwords[offset++] = gpu_fetch.dword_3;
+    dwords[offset++] = gpu_fetch.dword_4;
+    dwords[offset++] = gpu_fetch.dword_5;
 
-  dwords[offset++] = xenos::MakePacketType3(xenos::PM4_XE_SWAP, 4);
-  dwords[offset++] = xe::gpu::xenos::kSwapSignature;
-  dwords[offset++] = frontbuffer_physical_address;
+    dwords[offset++] = xenos::MakePacketType3(xenos::PM4_XE_SWAP, 4);
+    dwords[offset++] = xe::gpu::xenos::kSwapSignature;
+    dwords[offset++] = frontbuffer_physical_address;
 
-  dwords[offset++] = *width;
-  dwords[offset++] = *height;
+    dwords[offset++] = *width;
+    dwords[offset++] = *height;
 
-  // Fill the rest of the buffer with NOP packets.
-  for (uint32_t i = offset; i < 64; i++) {
-    dwords[i] = xenos::MakePacketType2();
+    // Fill the rest of the buffer with NOP packets.
+    for (uint32_t i = offset; i < 64; i++) {
+      dwords[i] = xenos::MakePacketType2();
+    }
   }
 
-  // Trigger IssueSwap directly on the GPU command processor thread.
+  // Trigger the swapchain present on the GPU command processor thread.
   // When games build system command buffers (Indirect Buffers) rather than
   // writing directly into the primary ringbuffer, the PM4_XE_SWAP packet
   // written above may be placed in a buffer region that is not referenced by
-  // the outer PM4_INDIRECT_BUFFER dispatch. Direct invocation ensures the
-  // swapchain present path is executed for every VdSwap call.
+  // the outer PM4_INDIRECT_BUFFER dispatch, so we can't rely on the CP hitting
+  // it. But calling IssueSwap straight from this CallInThread lambda races
+  // ahead of the composite resolve the guest submitted just before VdSwap
+  // (pending_fns_ are drained before ExecutePrimaryBuffer), which presents a
+  // stale / half-composited frame. Set the texture fetch now (the swap reads
+  // it) but defer the present itself until the worker has drained the ring.
   auto graphics_system = kernel_state()->emulator()->graphics_system();
   if (graphics_system && graphics_system->command_processor()) {
     auto cp = graphics_system->command_processor();
@@ -562,7 +589,7 @@ void VdSwap_entry(
       if (graphics_system->register_file()) {
         graphics_system->register_file()->SetTextureFetch(0, gpu_fetch);
       }
-      cp->IssueSwap(fb_ptr, w, h);
+      cp->RequestSwapAfterRingDrain(fb_ptr, w, h, gpu_fetch);
     });
   }
 }

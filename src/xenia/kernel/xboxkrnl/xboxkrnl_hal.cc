@@ -7,6 +7,8 @@
  ******************************************************************************
  */
 
+#include <cstdio>
+
 #include "xenia/kernel/smc.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
@@ -37,7 +39,11 @@ void HalReturnToFirmware_entry(dword_t routine) {
       static_cast<size_t>(routine) < FirmwareReentryMessage.size()
           ? FirmwareReentryMessage[routine]
           : fmt::format("Reboot (Routine Code: {})", routine.value()));
-  XELOGE(exitMessage);
+  XELOGE("========================================================");
+  XELOGE("=== GUEST HALT: {} (routine={}) ===", exitMessage, routine.value());
+  XELOGE("========================================================");
+  fflush(stdout);
+  fflush(stderr);
   exit(0);
 }
 DECLARE_XBOXKRNL_EXPORT2(HalReturnToFirmware, kNone, kStub, kImportant);
