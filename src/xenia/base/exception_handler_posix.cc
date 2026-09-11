@@ -483,6 +483,46 @@ static void DarwinExceptionHandlerCallback(int signal_number, siginfo_t* signal_
     void* frames[128];
     int frame_count = backtrace(frames, 128);
     backtrace_symbols_fd(frames, frame_count, STDERR_FILENO);
+
+    // macos-arm64 Fable II bring-up: also dump the vm_region_64 info at the
+    // faulting PC - tells us whether it landed in genuinely unmapped memory,
+    // a read-only/non-executable region (JIT code cache mprotect race?), or
+    // a plausible-but-wrong executable region, without needing a debugger.
+    {
+      vm_address_t region = static_cast<vm_address_t>(mc->__ss.__pc);
+      vm_size_t region_size = 0;
+      vm_region_basic_info_data_64_t info;
+      mach_msg_type_number_t info_count = VM_REGION_BASIC_INFO_COUNT_64;
+      mach_port_t obj = MACH_PORT_NULL;
+      kern_return_t kr = vm_region_64(
+          mach_task_self(), &region, &region_size, VM_REGION_BASIC_INFO_64,
+          reinterpret_cast<vm_region_info_t>(&info), &info_count, &obj);
+      char region_buf[256];
+      int region_len;
+      if (kr == KERN_SUCCESS) {
+        region_len = snprintf(
+            region_buf, sizeof(region_buf),
+            "pc region: base=0x%llx size=0x%llx prot=%c%c%c max_prot=%c%c%c\n",
+            static_cast<unsigned long long>(region),
+            static_cast<unsigned long long>(region_size),
+            (info.protection & VM_PROT_READ) ? 'r' : '-',
+            (info.protection & VM_PROT_WRITE) ? 'w' : '-',
+            (info.protection & VM_PROT_EXECUTE) ? 'x' : '-',
+            (info.max_protection & VM_PROT_READ) ? 'r' : '-',
+            (info.max_protection & VM_PROT_WRITE) ? 'w' : '-',
+            (info.max_protection & VM_PROT_EXECUTE) ? 'x' : '-');
+      } else {
+        region_len = snprintf(region_buf, sizeof(region_buf),
+                              "pc region: vm_region_64 failed, kr=%d (no "
+                              "mapping found at/above pc - likely genuinely "
+                              "unmapped)\n",
+                              int(kr));
+      }
+      if (region_len > 0) {
+        ssize_t w = write(STDERR_FILENO, region_buf, size_t(region_len));
+        (void)w;
+      }
+    }
   }
 #endif
 

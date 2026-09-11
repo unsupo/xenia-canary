@@ -54,7 +54,22 @@ static uint64_t UndefinedCallExtern(void* raw_context, uint64_t function_ptr) {
   return 0;
 }
 
-static constexpr size_t kMaxCodeSize = 1_MiB;
+// macos-arm64 Fable II bring-up: this used to be 1_MiB, matching the x64
+// backend's kMaxCodeSize exactly - but the x64 backend constructs its
+// CodeGenerator with Xbyak::AutoGrow (transparently reallocates on
+// overflow), while this one uses Xbyak_aarch64::DontSetProtectRWE (a fixed,
+// non-growing buffer - the code cache manages W^X protection itself, which
+// AutoGrow's internal realloc-based growth isn't obviously compatible
+// with, so switching to AutoGrow wasn't the safe option here). A large
+// guest function (hit compiling a Bink-video/audio-decode routine during
+// Fable II level load) overflowed 1 MiB and threw Xbyak_aarch64::Error
+// ("code is too big") from CodeArray::dd(), aborting the whole emulator.
+// AArch64 is also a fixed-width RISC ISA - equivalent work routinely takes
+// more instructions (hence more bytes, despite each being smaller) than on
+// x64 - so parity with x64's 1 MiB was already an optimistic budget even
+// before considering AutoGrow's absence. Quadrupled to 4 MiB as a fixed,
+// safe headroom bump rather than restructuring the growth strategy.
+static constexpr size_t kMaxCodeSize = 4_MiB;
 
 // Register maps:
 // GPR allocatable registers: x22, x23, x24, x25, x26, x27, x28
