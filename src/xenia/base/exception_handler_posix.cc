@@ -480,6 +480,31 @@ static void DarwinExceptionHandlerCallback(int signal_number, siginfo_t* signal_
       ssize_t w = write(STDERR_FILENO, header, size_t(header_len));
       (void)w;
     }
+#if XE_ARCH_ARM64
+    // macos-arm64 Fable II bring-up: chasing a crash where a newly-created
+    // guest thread's Processor::Execute lands in genuinely unmapped memory
+    // (pc looks like raw ARM64 instruction bytes, not a data pointer -
+    // suggests an indirect branch, e.g. the A64 backend's
+    // ResolveFunctionThunk's `br x9`, jumped to a garbage value). pc alone
+    // doesn't say where that garbage came from. lr (x30) survives a plain
+    // `br` (only `bl`/`blr` write it), so it should still hold the return
+    // address into whichever guest function's compiled code executed the
+    // bad branch - print it plus x9/x16 (the resolved-function-pointer and
+    // original-guest-target registers in that specific thunk) so the
+    // calling context can be identified without a live debugger, which
+    // Mach-exception interception makes unworkable here (see SESSION_LOG).
+    char regs[256];
+    int regs_len = snprintf(
+        regs, sizeof(regs), "lr=0x%llx x9=0x%llx x16=0x%llx sp=0x%llx\n",
+        static_cast<unsigned long long>(mc->__ss.__lr),
+        static_cast<unsigned long long>(mc->__ss.__x[9]),
+        static_cast<unsigned long long>(mc->__ss.__x[16]),
+        static_cast<unsigned long long>(mc->__ss.__sp));
+    if (regs_len > 0) {
+      ssize_t w = write(STDERR_FILENO, regs, size_t(regs_len));
+      (void)w;
+    }
+#endif
     void* frames[128];
     int frame_count = backtrace(frames, 128);
     backtrace_symbols_fd(frames, frame_count, STDERR_FILENO);
