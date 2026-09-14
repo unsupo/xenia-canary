@@ -645,7 +645,19 @@ void A64Emitter::EnsureSynchronizedGuestAndHostStack() {
     // Set up arguments for the sync helper:
     //   x8 = return address (where to resume after fixup)
     //   x9 = this function's stack size
-    e.adr(e.x8, return_from_sync);
+    //
+    // macos-arm64 Fable II bring-up: `adr` only encodes a 21-bit signed
+    // byte offset (+/-1 MiB reach) - same "too far" failure mode as
+    // CBZ/CBNZ/B.cond (bug #5) once kMaxCodeSize allowed functions up to
+    // 4 MiB, and this tail block can be arbitrarily far from
+    // return_from_sync's position in the function body. Unlike a branch,
+    // there's no cheap two-instruction island for a PC-relative address
+    // load that reaches further - so load the label's already-resolved
+    // absolute host address directly instead of computing it PC-relative.
+    // This tail callback always runs after the main body (including
+    // L(return_from_sync) below) has already been emitted, so
+    // getAddress() is guaranteed non-null here.
+    e.mov(e.x8, reinterpret_cast<uint64_t>(return_from_sync.getAddress()));
     e.mov(e.x9, static_cast<uint64_t>(e.stack_size()));
     e.mov(e.x10, reinterpret_cast<uint64_t>(
                      e.backend()->synchronize_guest_and_host_stack_helper()));
